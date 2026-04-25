@@ -1,0 +1,38 @@
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+!gradle/wrapper/gradle-wrapper.properties
+
+# Android
+local.properties
+*.apk
+*.aab
+*.ap_
+*.dex
+captures/
+output.json
+
+# IDEs
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# NDK / native
+.cxx/
+obj/
+
+# Kotlin
+.kotlin/
+
+# Keystore (never commit)
+*.jks
+*.keystore
+release-keys/
+
+# Downloaded model cache if ever placed in-tree
+models/
+*.onnx
+*.onnx_data
+*.bin

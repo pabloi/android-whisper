@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Whispr</string>
+    <string name="pick_audio">Pick audio file</string>
+    <string name="transcribe">Transcribe</string>
+    <string name="cancel">Cancel</string>
+    <string name="copy">Copy</string>
+    <string name="share">Share</string>
+    <string name="settings">Settings</string>
+    <string name="engine_local">On-device (Hexagon NPU)</string>
+    <string name="engine_remote">Remote (OpenAI-compatible)</string>
+    <string name="download_model">Download model</string>
+    <string name="model_ready">Model ready</string>
+</resources>
