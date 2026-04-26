@@ -165,7 +165,11 @@ class LocalQnnWhisperEngine(
 
                 val chunkStart = cIdx * MelSpectrogram.CHUNK_SECONDS.toDouble()
                 val chunkEnd = chunkStart + MelSpectrogram.CHUNK_SECONDS
-                val text = tokenizer!!.decode(tokens, skipSpecial = true).trim()
+                val rawText = tokenizer!!.decode(tokens, skipSpecial = true).trim()
+                // Whisper emits per-utterance timestamp tokens (`<|X.XX|>`,
+                // chunk-local 0–30 s); shift them to global file time by
+                // adding the chunk's start offset.
+                val text = shiftWhisperTimestamps(rawText, chunkStart)
                 if (text.isNotEmpty()) {
                     emit(TranscribeEvent.Segment(text, chunkStart, chunkEnd))
                     if (sbOut.isNotEmpty()) sbOut.append(' ')
@@ -349,6 +353,14 @@ class LocalQnnWhisperEngine(
         }
     }
 
+    private fun shiftWhisperTimestamps(text: String, offsetSec: Double): String {
+        if (offsetSec == 0.0 || !text.contains("<|")) return text
+        return WHISPER_TIMESTAMP_RX.replace(text) { m ->
+            val shifted = m.groupValues[1].toDouble() + offsetSec
+            "<|" + String.format(java.util.Locale.ROOT, "%.2f", shifted) + "|>"
+        }
+    }
+
     private fun argmaxFp16(logits: ShortBuffer): Int {
         logits.rewind()
         var best = 0
@@ -377,5 +389,7 @@ class LocalQnnWhisperEngine(
         private const val TAG = "LocalQnnWhisperEngine"
         /** Force a session close+reopen every N chunks to bound DSP context growth. */
         private const val SESSION_RESET_EVERY = 8
+        /** Matches Whisper's per-utterance timestamp tokens `<|3.84|>`. */
+        private val WHISPER_TIMESTAMP_RX = Regex("""<\|(\d+\.\d{1,3})\|>""")
     }
 }
