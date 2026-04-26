@@ -14,12 +14,13 @@ coroutines = "1.9.0"
 documentfile = "1.0.1"
 # ONNX Runtime Android build that bundles the QNN Execution Provider.
 # This is the artifact that lets the Hexagon NPU on SD 8 Gen 3 run the
-# precompiled QNN payload inside Qualcomm's Whisper-Large-V3-Turbo ONNX.
-# Qualcomm's v0.51.0 release was compiled against ORT 1.24.3; bump this
-# to 1.24.x once it's published to Maven Central. 1.23.0 is the latest
-# available at time of writing and ships a recent enough QAIRT runtime
-# to load the precompiled .bin in practice.
-onnxruntime = "1.23.0"
+# precompiled QNN payload inside Qualcomm's Whisper-* QNN-ONNX bundles.
+# Pinned to 1.24.3 to match the version Qualcomm used to compile the v0.51.0
+# precompiled_qnn_onnx assets (per their release_assets.json `tool_versions`).
+# The .onnx wrappers use ONNX IR v12, which 1.23.x cannot parse ("unsupported
+# model IR version: 12, max supported IR version: 11"). 1.24.x adds IR v12
+# support; bump in lockstep with whatever version Qualcomm uses next.
+onnxruntime = "1.24.3"
 
 [libraries]
 androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "coreKtx" }

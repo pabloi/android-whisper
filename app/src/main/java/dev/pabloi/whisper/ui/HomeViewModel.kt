@@ -9,17 +9,26 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.pabloi.whisper.WhisprApp
 import dev.pabloi.whisper.data.EngineChoice
+import dev.pabloi.whisper.data.TranscriptWriter
 import dev.pabloi.whisper.engine.AudioSource
 import dev.pabloi.whisper.engine.EngineFactory
 import dev.pabloi.whisper.engine.TranscribeEvent
 import dev.pabloi.whisper.engine.TranscribeOptions
-import dev.pabloi.whisper.engine.local.ModelRepository
+import dev.pabloi.whisper.engine.local.ModelCatalog
+import dev.pabloi.whisper.engine.local.ModelDownloadService
+import dev.pabloi.whisper.engine.local.ModelSpec
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 
 data class TranscribeUiState(
@@ -33,6 +42,7 @@ data class TranscribeUiState(
 )
 
 data class DownloadUiState(
+    val activeSpec: ModelSpec = ModelCatalog.default,
     val installed: Boolean = false,
     val inProgress: Boolean = false,
     val progress: Float = 0f,
@@ -42,35 +52,58 @@ data class DownloadUiState(
 
 class HomeViewModel(app: Application) : AndroidViewModel(app) {
     private val whispr = app as WhisprApp
-    private val repo: ModelRepository = whispr.modelRepo
     private val settingsStore = whispr.settings
 
     private val _transcribe = MutableStateFlow(TranscribeUiState())
     val transcribe: StateFlow<TranscribeUiState> = _transcribe.asStateFlow()
 
-    private val _download = MutableStateFlow(DownloadUiState(installed = repo.isInstalled()))
+    private val _download = MutableStateFlow(DownloadUiState())
     val download: StateFlow<DownloadUiState> = _download.asStateFlow()
 
     val settings = settingsStore.flow
 
     private var job: Job? = null
 
-    fun startDownload() {
-        if (_download.value.inProgress) return
+    init {
+        @OptIn(ExperimentalCoroutinesApi::class)
         viewModelScope.launch {
-            _download.value = DownloadUiState(inProgress = true)
-            try {
-                repo.download().collectLatest { p ->
-                    _download.value = _download.value.copy(
-                        progress = p.fraction, message = p.message
-                    )
-                }
-                _download.value = DownloadUiState(installed = repo.isInstalled(), progress = 1f, message = "Installed")
-            } catch (t: Throwable) {
-                _download.value = DownloadUiState(
-                    installed = repo.isInstalled(), error = t.message ?: t::class.java.simpleName
-                )
-            }
+            // The active spec is derived from settings; whenever it changes we
+            // rewire to that spec's per-model service flows.
+            settingsStore.flow
+                .map { ModelCatalog.resolve(it.localModelId) }
+                .distinctUntilChanged()
+                .flatMapLatest { spec -> downloadStateFor(spec) }
+                .collectLatest { _download.value = it }
+        }
+    }
+
+    private fun downloadStateFor(spec: ModelSpec): Flow<DownloadUiState> {
+        val repo = whispr.repoFor(spec)
+        return combine(
+            ModelDownloadService.running(spec.id),
+            ModelDownloadService.progress(spec.id),
+            ModelDownloadService.error(spec.id),
+        ) { running, p, err ->
+            DownloadUiState(
+                activeSpec = spec,
+                installed = repo.isInstalled(),
+                inProgress = running,
+                progress = p.fraction,
+                message = p.message,
+                error = err,
+            )
+        }
+    }
+
+    fun startDownload() = startDownloadFor(_download.value.activeSpec.id)
+
+    fun startDownloadFor(modelId: String) {
+        ModelDownloadService.start(getApplication(), modelId)
+    }
+
+    fun selectLocalModel(modelId: String) {
+        viewModelScope.launch {
+            settingsStore.update { it.copy(localModelId = modelId) }
         }
     }
 
@@ -86,13 +119,21 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
             _transcribe.value = TranscribeUiState(busy = true, statusMessage = "Preparing")
             val current = settingsStore.flow.first()
             // If local engine chosen but assets missing, auto-pivot to download UI.
-            if (current.engine == EngineChoice.LOCAL && !repo.isInstalled()) {
-                _transcribe.value = TranscribeUiState(
-                    error = "Model not installed — tap Download first."
-                )
-                return@launch
+            if (current.engine == EngineChoice.LOCAL) {
+                val repo = whispr.repoForId(current.localModelId)
+                if (!repo.isInstalled()) {
+                    _transcribe.value = TranscribeUiState(
+                        error = "Model '${repo.spec.displayName}' not installed — tap Download first."
+                    )
+                    return@launch
+                }
             }
-            val engine = EngineFactory.create(getApplication(), current, repo)
+            val engine = EngineFactory.create(getApplication(), current)
+            val transcriptWriter = TranscriptWriter(getApplication(), uri).also { it.open() }
+            val savedTo = transcriptWriter.displayPath.ifBlank { null }
+            if (savedTo != null) {
+                _transcribe.value = _transcribe.value.copy(statusMessage = "Saving to $savedTo")
+            }
             try {
                 val opts = TranscribeOptions(
                     language = current.language.ifBlank { null },
@@ -104,13 +145,20 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
                         is TranscribeEvent.Progress -> state.copy(
                             progress = ev.fraction, statusMessage = ev.message ?: state.statusMessage
                         )
-                        is TranscribeEvent.Segment -> state.copy(
-                            segments = state.segments + (formatTime(ev.startSec, ev.endSec) to ev.text)
-                        )
-                        is TranscribeEvent.Final -> state.copy(
-                            busy = false, progress = 1f, statusMessage = "Done",
-                            finalText = ev.text, lastDurationMs = ev.durationMs
-                        )
+                        is TranscribeEvent.Segment -> {
+                            transcriptWriter.appendSegment(ev.startSec, ev.endSec, ev.text)
+                            state.copy(
+                                segments = state.segments + (formatTime(ev.startSec, ev.endSec) to ev.text)
+                            )
+                        }
+                        is TranscribeEvent.Final -> {
+                            transcriptWriter.appendFooter("# Done in ${ev.durationMs} ms")
+                            val tail = savedTo?.let { " · saved to $it" } ?: ""
+                            state.copy(
+                                busy = false, progress = 1f, statusMessage = "Done$tail",
+                                finalText = ev.text, lastDurationMs = ev.durationMs
+                            )
+                        }
                         is TranscribeEvent.Failure -> state.copy(
                             busy = false, error = ev.cause.message ?: ev.cause::class.java.simpleName
                         )
@@ -121,6 +169,7 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
                     busy = false, error = t.message ?: t::class.java.simpleName
                 )
             } finally {
+                transcriptWriter.close()
                 engine.close()
             }
         }

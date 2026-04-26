@@ -1,6 +1,8 @@
 package dev.pabloi.whisper.ui
 
+import android.app.Activity
 import android.content.Intent
+import android.view.WindowManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -32,6 +34,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
@@ -50,6 +53,18 @@ fun HomeScreen(
     val dl by vm.download.collectAsState()
     val settings by vm.settings.collectAsState(initial = dev.pabloi.whisper.data.AppSettings())
     val context = LocalContext.current
+
+    // Big-model download or NPU transcription suffer if Samsung Freecess freezes
+    // us when the screen turns off. Hold the screen on while either is in flight;
+    // it auto-releases when the work completes.
+    val keepScreenOn = dl.inProgress || state.busy
+    val activity = context as? Activity
+    DisposableEffect(keepScreenOn, activity) {
+        val window = activity?.window
+        if (keepScreenOn) window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        else window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        onDispose { window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
+    }
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
@@ -194,9 +209,9 @@ private fun EngineBanner(name: String) {
 private fun DownloadCard(dl: DownloadUiState, onClick: () -> Unit) {
     Card {
         Column(Modifier.padding(12.dp)) {
-            Text("Download Whisper Large v3 Turbo (QNN)", style = MaterialTheme.typography.titleSmall)
+            Text("Download ${dl.activeSpec.displayName}", style = MaterialTheme.typography.titleSmall)
             Spacer(Modifier.height(4.dp))
-            Text("≈ 1.6 GB one-time download from Qualcomm AI Hub.", style = MaterialTheme.typography.bodySmall)
+            Text("≈ ${dl.activeSpec.approxSizeMb} MB one-time download from Qualcomm AI Hub.", style = MaterialTheme.typography.bodySmall)
             Spacer(Modifier.height(8.dp))
             if (dl.inProgress) {
                 LinearProgressIndicator(progress = { dl.progress }, modifier = Modifier.fillMaxWidth())

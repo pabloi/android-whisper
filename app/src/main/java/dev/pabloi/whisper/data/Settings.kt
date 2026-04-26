@@ -18,6 +18,8 @@ data class AppSettings(
     val remoteModelName: String = "whisper-1",
     val language: String = "",          // empty = auto-detect
     val timestamps: Boolean = false,
+    /** Active local-engine model id (matches a [dev.pabloi.whisper.engine.local.ModelSpec.id]). */
+    val localModelId: String = "whisper_large_v3_turbo",
 )
 
 private val Context.dataStore by preferencesDataStore(name = "whispr_settings")
@@ -29,6 +31,7 @@ class SettingsStore(private val context: Context) {
     private val modelKey = stringPreferencesKey("remote_model")
     private val langKey = stringPreferencesKey("language")
     private val tsKey = booleanPreferencesKey("timestamps")
+    private val localModelKey = stringPreferencesKey("local_model_id")
 
     val flow: Flow<AppSettings> = context.dataStore.data.map { prefs -> prefs.toSettings() }
 
@@ -42,6 +45,7 @@ class SettingsStore(private val context: Context) {
             prefs[modelKey] = next.remoteModelName
             prefs[langKey] = next.language
             prefs[tsKey] = next.timestamps
+            prefs[localModelKey] = next.localModelId
         }
     }
 
@@ -52,5 +56,6 @@ class SettingsStore(private val context: Context) {
         remoteModelName = this[modelKey].orEmpty().ifEmpty { "whisper-1" },
         language = this[langKey].orEmpty(),
         timestamps = this[tsKey] == true,
+        localModelId = this[localModelKey].orEmpty().ifEmpty { "whisper_large_v3_turbo" },
     )
 }

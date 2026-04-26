@@ -4,6 +4,13 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Big-file model downloads need to survive screen-off / Doze / Samsung
+         Freecess. We run them as a typed foreground service with a wake lock
+         and a user-visible progress notification. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- We only read files the user explicitly picks via SAF, so no
          READ_EXTERNAL_STORAGE / MANAGE_EXTERNAL_STORAGE needed. -->
 
@@ -24,7 +31,20 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.Whispr"
         android:usesCleartextTraffic="false"
+        android:extractNativeLibs="true"
         tools:targetApi="34">
+
+        <!-- QNN HTP backend dlopens these system libraries from /vendor/lib64
+             at runtime to talk to the Hexagon DSP. On Android 12+ apps must
+             declare each one explicitly or the loader rejects it with
+             "library not found in namespace". required=false so the install
+             still works on devices that lack them — we just won't run NPU. -->
+        <uses-native-library android:name="libcdsprpc.so" android:required="false" />
+        <uses-native-library android:name="libadsprpc.so" android:required="false" />
+        <uses-native-library android:name="libsdsprpc.so" android:required="false" />
+        <uses-native-library android:name="libfastrpc.so" android:required="false" />
+        <uses-native-library android:name="libdmabufheap.so" android:required="false" />
+        <uses-native-library android:name="libvmmem.so" android:required="false" />
 
         <activity
             android:name=".MainActivity"
@@ -50,5 +70,10 @@
                 <data android:mimeType="audio/*" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name=".engine.local.ModelDownloadService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
     </application>
 </manifest>

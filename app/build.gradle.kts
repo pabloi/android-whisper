@@ -71,8 +71,11 @@ android {
             "/META-INF/LICENSE*",
             "/META-INF/NOTICE*"
         )
-        // ORT's Android AAR ships libonnxruntime.so + QNN libs for arm64; keep them.
-        jniLibs.useLegacyPackaging = false
+        // QNN's fastrpc DSP loader (`libcdsprpc.so`) reads the per-DSP `*Skel.so`
+        // files via real filesystem paths — it cannot dlopen a library that
+        // lives mmap'd inside an APK. Force extraction at install time so the
+        // skel files land in `/data/app/<pkg>/lib/arm64/`.
+        jniLibs.useLegacyPackaging = true
     }
 
     androidResources {

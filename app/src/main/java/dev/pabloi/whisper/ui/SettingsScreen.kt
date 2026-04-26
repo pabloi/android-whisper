@@ -12,12 +12,17 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -34,6 +39,9 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.pabloi.whisper.data.AppSettings
 import dev.pabloi.whisper.data.EngineChoice
+import dev.pabloi.whisper.engine.local.ModelCatalog
+import dev.pabloi.whisper.engine.local.ModelDownloadService
+import dev.pabloi.whisper.engine.local.ModelSpec
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -82,6 +90,31 @@ fun SettingsScreen(
                 )
             }
 
+            if (settings.engine == EngineChoice.LOCAL) {
+                Text("On-device model", style = MaterialTheme.typography.titleSmall)
+                Text(
+                    "Tiny / Base / Small are great for fast iteration. Turbo gives the best accuracy.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    ModelCatalog.specs.forEach { spec ->
+                        ModelRow(
+                            spec = spec,
+                            selected = settings.localModelId == spec.id,
+                            onSelect = { update { it.copy(localModelId = spec.id) } },
+                            onDownload = { vm.startDownloadFor(spec.id) },
+                            onDelete = {
+                                app.repoFor(spec).clean()
+                                // Force a recomposition: settings flow re-emits when the
+                                // user toggles the radio, which is enough to re-query
+                                // installed-state in the row composable.
+                                update { it.copy(localModelId = it.localModelId) }
+                            },
+                        )
+                    }
+                }
+            }
+
             if (settings.engine == EngineChoice.REMOTE) {
                 Card {
                     Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -128,6 +161,51 @@ fun SettingsScreen(
                 )
                 Spacer(Modifier.height(0.dp))
                 Text("  Emit per-segment timestamps", modifier = Modifier.padding(start = 8.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun ModelRow(
+    spec: ModelSpec,
+    selected: Boolean,
+    onSelect: () -> Unit,
+    onDownload: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    val app = androidx.compose.ui.platform.LocalContext.current.applicationContext as dev.pabloi.whisper.WhisprApp
+    val running by ModelDownloadService.running(spec.id).collectAsState()
+    val progress by ModelDownloadService.progress(spec.id).collectAsState()
+    val error by ModelDownloadService.error(spec.id).collectAsState()
+    val installed = app.repoFor(spec).isInstalled()
+
+    Card {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                RadioButton(selected = selected, onClick = onSelect, enabled = installed)
+                Column(Modifier.padding(start = 4.dp)) {
+                    Text(spec.displayName, style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        if (installed) "Installed" else "${spec.approxSizeMb} MB · not installed",
+                        style = MaterialTheme.typography.labelSmall
+                    )
+                }
+            }
+            if (running) {
+                LinearProgressIndicator(progress = { progress.fraction }, modifier = Modifier.fillMaxWidth())
+                Text(progress.message, style = MaterialTheme.typography.labelSmall)
+            } else {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (!installed) {
+                        Button(onClick = onDownload) { Text("Download") }
+                    } else {
+                        OutlinedButton(onClick = onDelete) { Text("Delete") }
+                    }
+                    error?.let {
+                        Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
+                    }
+                }
             }
         }
     }

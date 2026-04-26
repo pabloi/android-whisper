@@ -15,25 +15,20 @@ import java.util.concurrent.TimeUnit
 import java.util.zip.ZipFile
 
 /**
- * On-demand fetcher for the precompiled QNN-ONNX Whisper assets.
+ * On-demand fetcher for one Whisper variant's precompiled QNN-ONNX assets.
  *
- * Asset manifest is Qualcomm's `release_assets.json` at
- *   https://huggingface.co/qualcomm/Whisper-Large-V3-Turbo/raw/main/release_assets.json
- * which we consume here. For v1 we hard-target the chipset we care about —
- * the S24 Ultra's Snapdragon 8 Gen 3 for Galaxy (a.k.a. "qualcomm-snapdragon-8gen3"
- * in the manifest).
+ * One [ModelRepository] instance per [ModelSpec]; each lives in its own
+ * `filesDir/models/<spec.id>/` subdirectory so multiple models can coexist.
  *
- * The zip contains four files:
- *   encoder.onnx, encoder_qairt_context.bin
- *   decoder.onnx, decoder_qairt_context.bin
- * The .onnx wraps a QNN EP context node that references the .bin via its
- * relative name, so both must sit next to each other on disk.
+ * Each zip contains four files (encoder/decoder .onnx + matching `_qairt_context.bin`).
+ * The .onnx wraps a QNN EP context node referencing the .bin by relative
+ * name, so both must sit next to each other on disk. Tokenizer is fetched
+ * separately from the corresponding `openai/whisper-*` HF repo.
  *
- * We download to a temp file first (so we can request HTTP Range resume if
- * a download is interrupted), then extract. The extract step is cheap —
- * under a minute on device — and the temp file is deleted once we're done.
+ * Resume is via HTTP `Range:` against a `bundle.zip.partial` temp file; the
+ * extract step runs only once the full zip is on disk.
  */
-class ModelRepository(context: Context) {
+class ModelRepository(context: Context, val spec: ModelSpec) {
 
     data class Assets(
         val encoderOnnx: File,
@@ -43,7 +38,7 @@ class ModelRepository(context: Context) {
         val ready: Boolean get() = encoderOnnx.exists() && decoderOnnx.exists() && tokenizerJson.exists()
     }
 
-    private val modelRoot = File(context.filesDir, "models/whisper_large_v3_turbo_qnn").apply { mkdirs() }
+    private val modelRoot = File(context.filesDir, "models/${spec.id}").apply { mkdirs() }
     private val markerFile = File(modelRoot, ".complete")
     private val tempZip = File(modelRoot, "bundle.zip.partial")
     private val http = OkHttpClient.Builder()
@@ -66,16 +61,14 @@ class ModelRepository(context: Context) {
             emit(Progress(1f, "Already installed"))
             return@flow
         }
-        // Leave stale .bin/.onnx behind if partial; download only overwrites
-        // the .zip.partial, and extract runs last.
         markerFile.delete()
         emit(Progress(0f, "Contacting asset host"))
 
         val existing = if (tempZip.exists()) tempZip.length() else 0L
-        val builder = Request.Builder().url(ZIP_URL)
+        val builder = Request.Builder().url(spec.zipUrl)
         if (existing > 0) builder.header("Range", "bytes=$existing-")
         http.newCall(builder.build()).execute().use { resp ->
-            if (resp.code != 200 && resp.code != 206) error("HTTP ${resp.code} from $ZIP_URL")
+            if (resp.code != 200 && resp.code != 206) error("HTTP ${resp.code} from ${spec.zipUrl}")
             val body = resp.body ?: error("Empty response")
             val contentLength = body.contentLength()
             val total = if (resp.code == 206) existing + contentLength else contentLength
@@ -90,7 +83,6 @@ class ModelRepository(context: Context) {
                         if (n <= 0) break
                         raf.write(buf, 0, n)
                         written += n
-                        // throttle emits to ~10 Hz so the Flow collector isn't flooded
                         val now = System.nanoTime()
                         if (now - lastTick > 100_000_000L) {
                             emit(Progress(
@@ -119,9 +111,9 @@ class ModelRepository(context: Context) {
     }.flowOn(Dispatchers.IO)
 
     private fun downloadTokenizer() {
-        val req = Request.Builder().url(TOKENIZER_URL).build()
+        val req = Request.Builder().url(spec.tokenizerUrl).build()
         http.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) error("HTTP ${resp.code} from $TOKENIZER_URL")
+            if (!resp.isSuccessful) error("HTTP ${resp.code} from ${spec.tokenizerUrl}")
             val body = resp.body ?: error("Empty tokenizer response")
             FileOutputStream(assets.tokenizerJson).use { fos ->
                 body.byteStream().use { ins ->
@@ -155,7 +147,7 @@ class ModelRepository(context: Context) {
                         }
                     }
                 }
-                Log.i(TAG, "Extracted ${out.name} (${out.length()} bytes)")
+                Log.i(TAG, "Extracted ${out.name} (${out.length()} bytes) for ${spec.id}")
             }
         }
     }
@@ -177,13 +169,6 @@ class ModelRepository(context: Context) {
 
     companion object {
         private const val TAG = "ModelRepository"
-        // Resolved from release_assets.json on 2026-04. If Qualcomm bumps the
-        // version, re-fetch the manifest and update this URL.
-        const val ZIP_URL = "https://qaihub-public-assets.s3.us-west-2.amazonaws.com/" +
-            "qai-hub-models/models/whisper_large_v3_turbo/releases/v0.51.0/" +
-            "whisper_large_v3_turbo-precompiled_qnn_onnx-float-qualcomm_snapdragon_8gen3.zip"
-        const val TOKENIZER_URL =
-            "https://huggingface.co/openai/whisper-large-v3-turbo/resolve/main/tokenizer.json"
         private val KEEP = setOf(
             "encoder.onnx",
             "encoder_qairt_context.bin",
