@@ -28,6 +28,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withLock
 import kotlin.math.log10
 import kotlin.math.sqrt
 
@@ -49,6 +50,9 @@ class AudioCapture(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var readerJob: Job? = null
     @Volatile private var paused = false
+
+    private val reopenMutex = kotlinx.coroutines.sync.Mutex()
+    private var reopenJob: Job? = null
 
     private val _frames = MutableSharedFlow<PcmFrame>(
         replay = 0, extraBufferCapacity = 64, onBufferOverflow = BufferOverflow.DROP_OLDEST
@@ -143,22 +147,51 @@ class AudioCapture(
     private fun registerRouteCallback() {
         val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         val cb = object : AudioDeviceCallback() {
-            override fun onAudioDevicesAdded(added: Array<out AudioDeviceInfo>?) = reopen()
-            override fun onAudioDevicesRemoved(removed: Array<out AudioDeviceInfo>?) = reopen()
+            override fun onAudioDevicesAdded(added: Array<out AudioDeviceInfo>?) {
+                if (shouldReopenOn(added)) reopen()
+            }
+            override fun onAudioDevicesRemoved(removed: Array<out AudioDeviceInfo>?) {
+                if (shouldReopenOn(removed)) reopen()
+            }
         }
         deviceCb = cb
         am.registerAudioDeviceCallback(cb, Handler(Looper.getMainLooper()))
     }
 
+    /**
+     * Decide whether a device-list change merits a [reopen]. Filters out the
+     * synchronous initial "added" callback that fires at registration with the
+     * existing device list (which would otherwise cause a spurious teardown/rebuild
+     * right after [open]). Triggers only when the change involves the active route
+     * itself or a higher-priority input now present.
+     */
+    private fun shouldReopenOn(devices: Array<out AudioDeviceInfo>?): Boolean {
+        if (devices == null || devices.isEmpty()) return false
+        val activeId = record?.routedDevice?.id
+        val inputs = devices.filter { it.isSource }
+        if (inputs.isEmpty()) return false
+        val touchesActive = activeId != null && inputs.any { it.id == activeId }
+        val higherPriority = inputs.any { d ->
+            d.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+            d.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+            d.type == AudioDeviceInfo.TYPE_USB_HEADSET
+        } && (record?.routedDevice?.type == AudioDeviceInfo.TYPE_BUILTIN_MIC || activeId == null)
+        return touchesActive || higherPriority
+    }
+
     private fun reopen() {
-        // Drop and reconfigure on the next idle tick.
-        scope.launch {
-            try {
-                stopReaderAndRecord()
-                val device = pickActiveInputDevice()
-                val rate = device?.sampleRates?.firstOrNull() ?: 48_000
-                configureAndStart(device, rate)
-            } catch (_: Throwable) { /* surfaced as silence in level meter */ }
+        reopenJob?.cancel()
+        reopenJob = scope.launch {
+            reopenMutex.withLock {
+                try {
+                    stopReaderAndRecord()
+                    val device = pickActiveInputDevice()
+                    val rate = device?.sampleRates?.firstOrNull() ?: 48_000
+                    configureAndStart(device, rate)
+                } catch (_: Throwable) {
+                    /* surfaced as silence in level meter */
+                }
+            }
         }
     }
 
