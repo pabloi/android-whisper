@@ -14,6 +14,8 @@ import java.nio.ByteBuffer
  *   - `m4aFd`     : the SAF-supplied PFD where MediaMuxer builds an MP4 container.
  *                    `moov` is only written on close(), so a hard kill mid-record
  *                    leaves an unplayable .m4a — that's what the sidecar is for.
+ *                    Caller retains ownership and must keep the PFD open until
+ *                    AFTER calling AacWriter.close().
  *   - `adtsOut`   : OutputStream to a sidecar dotfile. We tee the same encoded
  *                    AAC frames here, prefixed with a 7-byte ADTS header. ADTS
  *                    streams are self-describing — every frame is independently
@@ -69,6 +71,7 @@ class AacWriter(
     }
 
     private fun drain(eos: Boolean) {
+        var eosRetries = 0
         val info = MediaCodec.BufferInfo()
         if (eos) {
             val inIdx = codec.dequeueInputBuffer(10_000)
@@ -83,7 +86,14 @@ class AacWriter(
                     muxer.start()
                     muxerStarted = true
                 }
-                outIdx == MediaCodec.INFO_TRY_AGAIN_LATER -> if (!eos) break@loop else break@loop
+                outIdx == MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                    if (!eos) break@loop
+                    // EOS: keep polling until BUFFER_FLAG_END_OF_STREAM lands.
+                    // The 10 ms timeout per dequeue plus a reasonable retry cap
+                    // means we wait at most a couple of hundred ms for the
+                    // encoder to flush its tail frames.
+                    if (++eosRetries > MAX_EOS_RETRIES) break@loop
+                }
                 outIdx >= 0 -> {
                     val outBuf = codec.getOutputBuffer(outIdx)!!
                     if ((info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0 && info.size > 0) {
@@ -94,6 +104,7 @@ class AacWriter(
                         adtsOut.write(header)
                         val raw = ByteArray(info.size); outBuf.get(raw)
                         adtsOut.write(raw)
+                        adtsOut.flush()
                     }
                     codec.releaseOutputBuffer(outIdx, false)
                     if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break@loop
@@ -113,12 +124,14 @@ class AacWriter(
 
     companion object {
         private const val MIME = "audio/mp4a-latm"
+        private const val MAX_EOS_RETRIES = 50  // ~500 ms at 10 ms/dequeue
 
         /**
          * Build the 7-byte ADTS header for a given payload+header length, sample rate
          * and channel count. AAC-LC profile (object type 2). MPEG-4. No CRC.
          */
         fun adtsHeader(packetLength: Int, sampleRate: Int, channels: Int): ByteArray {
+            require(channels in 1..2) { "Only mono/stereo supported (got $channels)" }
             val freqIdx = freqIndex(sampleRate)
             val h = ByteArray(7)
             h[0] = 0xFF.toByte()
