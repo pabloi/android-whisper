@@ -47,6 +47,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 @Composable
 fun HomeScreen(
     onOpenSettings: () -> Unit,
+    onOpenRecord: () -> Unit,
     vm: HomeViewModel = viewModel(),
 ) {
     val state by vm.transcribe.collectAsState()
@@ -103,12 +104,16 @@ fun HomeScreen(
             ) {
                 Button(
                     enabled = !state.busy,
+                    onClick = onOpenRecord,
+                    modifier = Modifier.weight(1f)
+                ) { Text("Record Live") }
+                Button(
+                    enabled = !state.busy,
                     onClick = {
                         picker.launch(arrayOf("audio/*", "application/ogg", "video/mp4"))
                     },
                     modifier = Modifier.weight(1f)
                 ) { Text("Pick audio file") }
-
                 if (state.busy) {
                     OutlinedButton(onClick = { vm.cancel() }) { Text("Cancel") }
                 }
@@ -188,6 +193,24 @@ fun HomeScreen(
                                     "  ${it / 1000.0}s",
                                     style = MaterialTheme.typography.labelSmall,
                                     modifier = Modifier.padding(start = 8.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            val recordings by vm.recordingsListStateOrEmpty().collectAsState(initial = emptyList())
+            if (recordings.isNotEmpty()) {
+                Text("Recordings", style = MaterialTheme.typography.titleSmall)
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    items(recordings) { r ->
+                        Card {
+                            Column(Modifier.padding(8.dp)) {
+                                Text(r.displayName, style = MaterialTheme.typography.bodyMedium)
+                                Text(
+                                    "${r.routeLabel} · ${r.sampleRate} Hz · ${r.durationMs / 1000}s",
+                                    style = MaterialTheme.typography.labelSmall
                                 )
                             }
                         }

@@ -30,7 +30,10 @@ class MainActivity : ComponentActivity() {
                 val nav = rememberNavController()
                 NavHost(navController = nav, startDestination = "home") {
                     composable("home") {
-                        HomeScreen(onOpenSettings = { nav.navigate("settings") })
+                        HomeScreen(
+                            onOpenSettings = { nav.navigate("settings") },
+                            onOpenRecord = {},
+                        )
                     }
                     composable("settings") {
                         SettingsScreen(onBack = { nav.popBackStack() })

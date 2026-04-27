@@ -180,6 +180,9 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         cm.setPrimaryClip(ClipData.newPlainText("Transcript", text))
     }
 
+    fun recordingsListStateOrEmpty(): kotlinx.coroutines.flow.Flow<List<dev.pabloi.whisper.recording.Recording>> =
+        dev.pabloi.whisper.recording.RecordingsStore(getApplication<Application>()).flow
+
     private fun formatTime(start: Double?, end: Double?): String {
         if (start == null || end == null) return ""
         fun fmt(s: Double): String {
