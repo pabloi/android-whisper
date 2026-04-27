@@ -61,6 +61,8 @@ class RecordingService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var capture: AudioCapture? = null
     private var aac: AacWriter? = null
+    private var m4aPfd: ParcelFileDescriptor? = null
+    private var sidecarOut: java.io.OutputStream? = null
     private var engineJob: Job? = null
     private var pcmJob: Job? = null
     private var clockJob: Job? = null
@@ -99,8 +101,10 @@ class RecordingService : Service() {
 
                 val pfd = contentResolver.openFileDescriptor(m4aDoc.uri, "rw")
                     ?: error("Cannot open .m4a for writing")
-                val sidecarOut = contentResolver.openOutputStream(sidecarDoc.uri)
+                val sidecar = contentResolver.openOutputStream(sidecarDoc.uri)
                     ?: error("Cannot open sidecar for writing")
+                m4aPfd = pfd
+                sidecarOut = sidecar
 
                 val cap = AudioCapture(this@RecordingService,
                     sourcePreset = AudioSourcePreset.valueOf(sourceName),
@@ -108,7 +112,7 @@ class RecordingService : Service() {
                 cap.open()
                 capture = cap
                 val rate = cap.sampleRate.value
-                aac = AacWriter(pfd, sidecarOut, sampleRate = rate, channels = 1)
+                aac = AacWriter(pfd, sidecar, sampleRate = rate, channels = 1)
 
                 val rec = Recording(
                     id = UUID.randomUUID().toString(),
@@ -229,7 +233,16 @@ class RecordingService : Service() {
         engineJob?.cancel(); engineJob = null
         engineChunks = null
         chunkBuilder = null
+        // Close the AAC writer first so it can flush its EOS frames into both
+        // the MediaMuxer .m4a (writing the moov) and the ADTS sidecar.
+        runCatching { aac?.close() }
         aac = null
+        // Then release the underlying SAF resources we opened, sidecar first
+        // so AacWriter's adtsOut flush has settled.
+        runCatching { sidecarOut?.close() }
+        sidecarOut = null
+        runCatching { m4aPfd?.close() }
+        m4aPfd = null
         capture = null
         releaseWakeLock()
     }
