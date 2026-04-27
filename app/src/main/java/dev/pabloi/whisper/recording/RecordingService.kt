@@ -66,6 +66,7 @@ class RecordingService : Service() {
     private var engineJob: Job? = null
     private var pcmJob: Job? = null
     private var clockJob: Job? = null
+    private var chunkForwardJob: Job? = null
     private var chunkBuilder: ChunkBuilder? = null
     private var engineChunks: Channel<FloatArray>? = null
     private var currentRecording: Recording? = null
@@ -173,24 +174,33 @@ class RecordingService : Service() {
         val cb = if (transcribeLive) ChunkBuilder().also { chunkBuilder = it } else null
         if (transcribeLive) {
             engineChunks = Channel(capacity = 4)
-            scope.launch {
+            chunkForwardJob = scope.launch {
                 cb!!.flow.collect { engineChunks!!.send(it) }
-                engineChunks?.close()
+                // Don't close engineChunks here — the channel is shared across
+                // pause/resume cycles. stopSelfAsync closes it explicitly.
             }
         }
         return scope.launch {
             cap.frames.collect { frame ->
-                // Writer: native-rate PCM straight into AAC.
+                // Writer: native-rate PCM straight into AAC. Continues during the
+                // pre-pause window so the .m4a is continuous.
                 val bb = ByteBuffer.allocate(frame.pcm.size * 2).order(ByteOrder.LITTLE_ENDIAN)
                 for (s in frame.pcm) bb.putShort(s)
                 bb.flip()
                 aac?.append(bb)
 
-                // Transcriber: resample to 16k, hand to ChunkBuilder.
-                if (transcribeLive) {
+                // Transcriber: only feed when actively Recording (not Paused/Stopping).
+                // The chunkBuilder may be closed/replaced by a focus pause; guard
+                // against the small window where capture.pause() hasn't yet taken
+                // effect and a stray frame would otherwise hit a closed channel.
+                if (transcribeLive && state.value is RecordingState.Recording) {
                     val builder = chunkBuilder
                     if (builder != null) {
-                        for (frame16k in resampler.process(frame.pcm)) builder.feed(frame16k)
+                        try {
+                            for (frame16k in resampler.process(frame.pcm)) builder.feed(frame16k)
+                        } catch (_: kotlinx.coroutines.channels.ClosedSendChannelException) {
+                            /* paused mid-feed; ignore */
+                        }
                     }
                 }
 
@@ -233,6 +243,7 @@ class RecordingService : Service() {
                 capture?.close()
                 pcmJob?.cancel()
                 chunkBuilder?.close()
+                chunkForwardJob?.cancel()
                 engineChunks?.close()
                 engineJob?.join()
                 aac?.close()
@@ -256,7 +267,9 @@ class RecordingService : Service() {
         val st = state.value
         if (st !is RecordingState.Recording) return
         capture?.pause()
-        scope.launch { chunkBuilder?.close() }  // emits the pre-call partial chunk if speech in buffer
+        val toClose = chunkBuilder
+        chunkBuilder = null
+        scope.launch { toClose?.close() }  // emits the pre-call partial chunk if speech in buffer
         _state.value = RecordingState.Paused(st.recordingId, "phone call", st.routeLabel)
     }
 
@@ -265,9 +278,13 @@ class RecordingService : Service() {
         if (st !is RecordingState.Paused) return
         capture?.resume()
         // Recreate ChunkBuilder for the post-resume buffer (the previous one is closed).
-        chunkBuilder = ChunkBuilder()
-        // Forward new chunks from the new ChunkBuilder into the existing engineChunks channel.
-        scope.launch { chunkBuilder!!.flow.collect { engineChunks?.send(it) } }
+        val newBuilder = ChunkBuilder()
+        chunkBuilder = newBuilder
+        // Replace the previous forwarder; its source flow already completed.
+        chunkForwardJob?.cancel()
+        chunkForwardJob = scope.launch {
+            newBuilder.flow.collect { engineChunks?.send(it) }
+        }
         _state.value = RecordingState.Recording(
             recordingId = st.recordingId,
             startedAtMs = startedAtMs,
@@ -275,7 +292,7 @@ class RecordingService : Service() {
             levelDb = -120f,
             routeLabel = st.routeLabel,
             sampleRate = capture?.sampleRate?.value ?: 48_000,
-            transcribing = chunkBuilder != null,
+            transcribing = newBuilder != null,
         )
     }
 
@@ -286,6 +303,7 @@ class RecordingService : Service() {
         focusRequest = null
         clockJob?.cancel(); clockJob = null
         engineJob?.cancel(); engineJob = null
+        chunkForwardJob?.cancel(); chunkForwardJob = null
         engineChunks = null
         chunkBuilder = null
         // Close the AAC writer first so it can flush its EOS frames into both
