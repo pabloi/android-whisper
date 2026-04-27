@@ -71,6 +71,16 @@ class RecordingService : Service() {
     private var currentRecording: Recording? = null
     private var startedAtMs: Long = 0L
 
+    private var focusRequest: android.media.AudioFocusRequest? = null
+    private val focusListener = android.media.AudioManager.OnAudioFocusChangeListener { change ->
+        when (change) {
+            android.media.AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+            android.media.AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> pauseDueToFocus()
+            android.media.AudioManager.AUDIOFOCUS_GAIN -> resumeFromFocus()
+            android.media.AudioManager.AUDIOFOCUS_LOSS -> stopSelfAsync()
+        }
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -135,6 +145,17 @@ class RecordingService : Service() {
                     transcribing = transcribeLive,
                 )
 
+                val am = getSystemService(AUDIO_SERVICE) as android.media.AudioManager
+                focusRequest = android.media.AudioFocusRequest.Builder(android.media.AudioManager.AUDIOFOCUS_GAIN)
+                    .setAudioAttributes(android.media.AudioAttributes.Builder()
+                        .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                        .build())
+                    .setOnAudioFocusChangeListener(focusListener)
+                    .setAcceptsDelayedFocusGain(false)
+                    .build()
+                am.requestAudioFocus(focusRequest!!)
+
                 pcmJob = launchPcmConsumers(cap, transcribeLive, rate)
                 if (transcribeLive) startEngineLoop()
                 clockJob = startClock()
@@ -166,8 +187,11 @@ class RecordingService : Service() {
                 aac?.append(bb)
 
                 // Transcriber: resample to 16k, hand to ChunkBuilder.
-                if (transcribeLive && cb != null) {
-                    for (frame16k in resampler.process(frame.pcm)) cb.feed(frame16k)
+                if (transcribeLive) {
+                    val builder = chunkBuilder
+                    if (builder != null) {
+                        for (frame16k in resampler.process(frame.pcm)) builder.feed(frame16k)
+                    }
                 }
 
                 // Update state.
@@ -228,7 +252,38 @@ class RecordingService : Service() {
         }
     }
 
+    private fun pauseDueToFocus() {
+        val st = state.value
+        if (st !is RecordingState.Recording) return
+        capture?.pause()
+        scope.launch { chunkBuilder?.close() }  // emits the pre-call partial chunk if speech in buffer
+        _state.value = RecordingState.Paused(st.recordingId, "phone call", st.routeLabel)
+    }
+
+    private fun resumeFromFocus() {
+        val st = state.value
+        if (st !is RecordingState.Paused) return
+        capture?.resume()
+        // Recreate ChunkBuilder for the post-resume buffer (the previous one is closed).
+        chunkBuilder = ChunkBuilder()
+        // Forward new chunks from the new ChunkBuilder into the existing engineChunks channel.
+        scope.launch { chunkBuilder!!.flow.collect { engineChunks?.send(it) } }
+        _state.value = RecordingState.Recording(
+            recordingId = st.recordingId,
+            startedAtMs = startedAtMs,
+            durationMs = System.currentTimeMillis() - startedAtMs,
+            levelDb = -120f,
+            routeLabel = st.routeLabel,
+            sampleRate = capture?.sampleRate?.value ?: 48_000,
+            transcribing = chunkBuilder != null,
+        )
+    }
+
     private fun cleanup() {
+        focusRequest?.let {
+            (getSystemService(AUDIO_SERVICE) as android.media.AudioManager).abandonAudioFocusRequest(it)
+        }
+        focusRequest = null
         clockJob?.cancel(); clockJob = null
         engineJob?.cancel(); engineJob = null
         engineChunks = null
