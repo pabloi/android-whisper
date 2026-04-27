@@ -19,6 +19,8 @@ android {
 
         // S24 Ultra is arm64-only; don't waste APK size on other ABIs.
         ndk { abiFilters += "arm64-v8a" }
+
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     signingConfigs {
@@ -107,4 +109,11 @@ dependencies {
     implementation(libs.onnxruntime.qnn)
 
     debugImplementation(libs.androidx.compose.ui.tooling)
+
+    testImplementation(libs.junit)
+    testImplementation(libs.kotlinx.coroutines.test)
+
+    androidTestImplementation(libs.androidx.test.junit)
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.kotlinx.coroutines.test)
 }
