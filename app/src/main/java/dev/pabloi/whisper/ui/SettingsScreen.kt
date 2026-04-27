@@ -1,5 +1,8 @@
 package dev.pabloi.whisper.ui
 
+import android.content.Intent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -8,6 +11,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -38,6 +42,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.pabloi.whisper.data.AppSettings
+import dev.pabloi.whisper.data.AudioSourcePreset
 import dev.pabloi.whisper.data.EngineChoice
 import dev.pabloi.whisper.engine.local.ModelCatalog
 import dev.pabloi.whisper.engine.local.ModelDownloadService
@@ -54,9 +59,22 @@ fun SettingsScreen(
     val settings by vm.settings.collectAsState(initial = AppSettings())
 
     // Delegate all updates through the SettingsStore via the WhisprApp singleton.
-    val app = androidx.compose.ui.platform.LocalContext.current.applicationContext as dev.pabloi.whisper.WhisprApp
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val app = context.applicationContext as dev.pabloi.whisper.WhisprApp
     fun update(block: (AppSettings) -> AppSettings) {
         scope.launch { app.settings.update(block) }
+    }
+
+    val folderLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) {
+            context.contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            )
+            update { it.copy(recordingsFolderUri = uri.toString()) }
+        }
     }
 
     Scaffold(
@@ -161,6 +179,56 @@ fun SettingsScreen(
                 )
                 Spacer(Modifier.height(0.dp))
                 Text("  Emit per-segment timestamps", modifier = Modifier.padding(start = 8.dp))
+            }
+
+            RecordingSection(
+                settings = settings,
+                onPickFolder = { folderLauncher.launch(null) },
+                onSourceChanged = { p -> update { it.copy(audioSourcePreset = p) } },
+                onEffectsChanged = { on -> update { it.copy(audioEffectsOn = on) } },
+            )
+        }
+    }
+}
+
+@Composable
+private fun RecordingSection(
+    settings: AppSettings,
+    onPickFolder: () -> Unit,
+    onSourceChanged: (AudioSourcePreset) -> Unit,
+    onEffectsChanged: (Boolean) -> Unit,
+) {
+    Card {
+        Column(Modifier.padding(12.dp)) {
+            Text("Recording", style = MaterialTheme.typography.titleSmall)
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "Folder: ${if (settings.recordingsFolderUri.isEmpty()) "Not set" else settings.recordingsFolderUri}",
+                style = MaterialTheme.typography.bodySmall
+            )
+            Spacer(Modifier.height(4.dp))
+            OutlinedButton(onClick = onPickFolder) { Text("Choose folder…") }
+
+            Spacer(Modifier.height(12.dp))
+            Text("Audio source preset")
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                AudioSourcePreset.entries.forEach { preset ->
+                    FilterChip(
+                        selected = preset == settings.audioSourcePreset,
+                        onClick = { onSourceChanged(preset) },
+                        label = { Text(preset.name) },
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Switch(checked = settings.audioEffectsOn, onCheckedChange = onEffectsChanged)
+                Spacer(Modifier.width(8.dp))
+                Text("Apply system NS / AGC")
             }
         }
     }
