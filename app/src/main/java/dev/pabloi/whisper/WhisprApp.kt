@@ -52,5 +52,13 @@ class WhisprApp : Application() {
             setShowBadge(false)
         }
         nm.createNotificationChannel(channel)
+        nm.createNotificationChannel(NotificationChannel(
+            dev.pabloi.whisper.recording.RecordingService.CHANNEL_ID,
+            "Live recording",
+            NotificationManager.IMPORTANCE_LOW,
+        ).apply {
+            description = "Whispr is recording audio."
+            setShowBadge(false)
+        })
     }
 }
