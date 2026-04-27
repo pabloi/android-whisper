@@ -32,8 +32,11 @@ class MainActivity : ComponentActivity() {
                     composable("home") {
                         HomeScreen(
                             onOpenSettings = { nav.navigate("settings") },
-                            onOpenRecord = {},
+                            onOpenRecord = { nav.navigate("record") },
                         )
+                    }
+                    composable("record") {
+                        dev.pabloi.whisper.ui.RecordScreen(onBack = { nav.popBackStack() })
                     }
                     composable("settings") {
                         SettingsScreen(onBack = { nav.popBackStack() })
