@@ -34,6 +34,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -85,6 +86,10 @@ class RecordingService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.getBooleanExtra(EXTRA_STOP, false) == true) {
+            stopSelfAsync()
+            return START_NOT_STICKY
+        }
         if (state.value !is RecordingState.Idle) return START_NOT_STICKY
         val transcribeLive = intent?.getBooleanExtra(EXTRA_TRANSCRIBE_LIVE, true) ?: true
         val sourceName = intent?.getStringExtra(EXTRA_SOURCE_PRESET) ?: AudioSourcePreset.VOICE_RECOGNITION.name
@@ -162,6 +167,17 @@ class RecordingService : Service() {
                 clockJob = startClock()
             } catch (t: Throwable) {
                 _state.value = RecordingState.Failure(t)
+                // If the failure happened after RecordingsStore.add(rec), the index
+                // would otherwise be stuck at RECORDING forever. Mark it ORPHANED so
+                // the next launch's reconciliation can deal with it.
+                val rec = currentRecording
+                if (rec != null) {
+                    try {
+                        RecordingsStore(applicationContext).update(rec.id) {
+                            it.copy(state = Recording.State.ORPHANED)
+                        }
+                    } catch (_: Throwable) { /* best effort */ }
+                }
                 cleanup()
                 stopSelf()
             }
@@ -241,7 +257,7 @@ class RecordingService : Service() {
         scope.launch {
             try {
                 capture?.close()
-                pcmJob?.cancel()
+                pcmJob?.cancelAndJoin()  // ensure no in-flight aac.append after this point
                 chunkBuilder?.close()
                 chunkForwardJob?.cancel()
                 engineChunks?.close()
@@ -381,12 +397,14 @@ class RecordingService : Service() {
         }
 
         fun stop(context: Context) {
-            // Send a STOP intent that the service interprets in onStartCommand.
-            // Simpler: use a static reference set in onCreate. But for now, the
-            // ViewModel calls stopService() and the service's onDestroy path
-            // also drives cleanup. RecordingService handles a STOP intent via
-            // the same pathway in case of redelivery.
-            context.stopService(Intent(context, RecordingService::class.java))
+            // Route Stop through onStartCommand so stopSelfAsync runs to completion
+            // (finalising the .m4a moov atom and the RecordingsStore index entry).
+            // stopService() would trigger onDestroy → scope.cancel() and kill the
+            // finalisation coroutines mid-flight, leaving an unplayable file and
+            // an orphan-looking RECORDING entry.
+            val intent = Intent(context, RecordingService::class.java)
+                .putExtra(EXTRA_STOP, true)
+            context.startService(intent)
         }
     }
 }
@@ -399,38 +417,46 @@ class RecordingService : Service() {
 internal class LiveResampler(val srcRate: Int, val dstRate: Int, val frameSamples: Int) {
     private val ratio = srcRate.toDouble() / dstRate
     private var srcPos = 0.0
-    private val accum = ArrayList<Float>()
-    private val pending = ArrayList<Float>()
+    private val accum = ArrayDeque<Float>()
+    private val pending = ArrayDeque<Float>()
 
     fun process(srcInt16: ShortArray): List<FloatArray> {
         // Append new source samples (scaled to f32 [-1,1]).
-        for (s in srcInt16) accum.add(s.toFloat() / Short.MAX_VALUE)
+        for (s in srcInt16) accum.addLast(s.toFloat() / Short.MAX_VALUE)
 
+        // We need indexed access; copy into a snapshot for resampling. The
+        // snapshot is small (one frame's worth at 48 kHz native ≈ 960 samples),
+        // so the copy is cheap and avoids the O(n) removeAt(0) we'd hit if we
+        // tried to interleave reads with shifts.
+        val snapshot = accum.toFloatArray()
         val out = ArrayList<Float>()
-        // Produce as many destination samples as we can given current `accum` buffer.
         while (true) {
             val i0 = srcPos.toInt()
             val i1 = i0 + 1
-            if (i1 >= accum.size) break
+            if (i1 >= snapshot.size) break
             val frac = (srcPos - i0).toFloat()
-            out.add(accum[i0] + (accum[i1] - accum[i0]) * frac)
+            out.add(snapshot[i0] + (snapshot[i1] - snapshot[i0]) * frac)
             srcPos += ratio
         }
-        // Trim consumed source samples (keep one sample of context for next call).
+        // Drop consumed source samples (keep one of context).
         val keepFrom = (srcPos.toInt() - 1).coerceAtLeast(0)
-        if (keepFrom > 0) {
-            repeat(keepFrom) { accum.removeAt(0) }
-            srcPos -= keepFrom
-        }
+        repeat(keepFrom) { accum.removeFirst() }
+        srcPos -= keepFrom
 
-        // Concatenate with any leftover and split into FRAME_SAMPLES-sized FloatArrays.
-        pending.addAll(out)
+        // Append output and slice into FRAME_SAMPLES-sized FloatArrays.
+        for (v in out) pending.addLast(v)
         val frames = ArrayList<FloatArray>()
         while (pending.size >= frameSamples) {
-            val f = FloatArray(frameSamples) { pending[it] }
-            repeat(frameSamples) { pending.removeAt(0) }
+            val f = FloatArray(frameSamples) { pending.removeFirst() }
             frames.add(f)
         }
         return frames
     }
+}
+
+private fun ArrayDeque<Float>.toFloatArray(): FloatArray {
+    val arr = FloatArray(size)
+    var i = 0
+    for (v in this) { arr[i] = v; i++ }
+    return arr
 }

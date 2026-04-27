@@ -55,7 +55,7 @@ class AudioCapture(
     private var reopenJob: Job? = null
 
     private val _frames = MutableSharedFlow<PcmFrame>(
-        replay = 0, extraBufferCapacity = 64, onBufferOverflow = BufferOverflow.DROP_OLDEST
+        replay = 0, extraBufferCapacity = 64, onBufferOverflow = BufferOverflow.SUSPEND
     )
     val frames: SharedFlow<PcmFrame> = _frames.asSharedFlow()
 
