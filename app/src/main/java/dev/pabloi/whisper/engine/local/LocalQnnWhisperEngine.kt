@@ -136,6 +136,7 @@ class LocalQnnWhisperEngine(
             is AudioSource.Pcm -> chunkPrebufferedPcm(audio.samples, chunkLen)
             is AudioSource.File -> AudioDecoder.streamMonoF32(audio.path, chunkLen)
             is AudioSource.Uri -> AudioDecoder.streamMonoF32(context, audio.uri, chunkLen)
+            is AudioSource.LiveStream -> audio.chunks
         }
 
         try {

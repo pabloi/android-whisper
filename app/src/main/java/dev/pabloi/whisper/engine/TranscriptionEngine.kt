@@ -35,6 +35,13 @@ sealed interface AudioSource {
             other is Pcm && samples.contentEquals(other.samples)
         override fun hashCode(): Int = samples.contentHashCode()
     }
+    /**
+     * Already-chunked 16-kHz mono f32 stream of 30-s frames (each [FloatArray] is
+     * exactly `MelSpectrogram.N_SAMPLES` long, zero-padded if needed). Used by the
+     * live-recording path so chunks flow straight from `ChunkBuilder` to the
+     * engine without round-tripping through MediaCodec.
+     */
+    data class LiveStream(val chunks: kotlinx.coroutines.flow.Flow<FloatArray>) : AudioSource
 }
 
 data class TranscribeOptions(

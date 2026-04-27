@@ -57,6 +57,12 @@ class RemoteOpenAIEngine(
     private val json = Json { ignoreUnknownKeys = true }
 
     override fun transcribe(audio: AudioSource, options: TranscribeOptions): Flow<TranscribeEvent> = flow {
+        if (audio is AudioSource.LiveStream) {
+            emit(TranscribeEvent.Failure(
+                IllegalArgumentException("Remote engine does not support live streaming")
+            ))
+            return@flow
+        }
         val t0 = System.currentTimeMillis()
         emit(TranscribeEvent.Progress(0.05f, "Preparing upload"))
         val (uploadFile, filename, mime, cleanup) = materialize(audio)
@@ -133,6 +139,9 @@ class RemoteOpenAIEngine(
                 writeWav16(audio.samples, AudioDecoder.TARGET_SAMPLE_RATE, dst)
                 Upload(dst, dst.name, "audio/wav") { dst.delete() }
             }
+            // Rejected at the top of transcribe(); unreachable in practice.
+            is AudioSource.LiveStream ->
+                error("Remote engine does not support live streaming")
         }
     }
 
