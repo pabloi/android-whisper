@@ -11,6 +11,7 @@ import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.media.audiofx.AutomaticGainControl
 import android.media.audiofx.NoiseSuppressor
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import androidx.core.content.ContextCompat
@@ -128,11 +129,22 @@ class AudioCapture(
     private fun pickActiveInputDevice(): AudioDeviceInfo? {
         val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         val inputs = am.getDevices(AudioManager.GET_DEVICES_INPUTS)
-        // Prefer BT SCO or wired headset if connected as input route.
-        return inputs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
-            ?: inputs.firstOrNull { it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET }
-            ?: inputs.firstOrNull { it.type == AudioDeviceInfo.TYPE_USB_HEADSET }
-            ?: inputs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
+
+        // Honor an explicit comm-device routing (e.g. user accepted a BT SCO
+        // call routing or a VOIP app called setCommunicationDevice). Otherwise
+        // the BT headset being merely paired/connected for media must NOT
+        // override the built-in mic for our recording.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val comm = am.communicationDevice
+            if (comm != null &&
+                comm.type != AudioDeviceInfo.TYPE_BUILTIN_MIC &&
+                comm.type != AudioDeviceInfo.TYPE_BUILTIN_EARPIECE &&
+                comm.type != AudioDeviceInfo.TYPE_BUILTIN_SPEAKER) {
+                inputs.firstOrNull { it.id == comm.id }?.let { return it }
+            }
+        }
+
+        return inputs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
             ?: inputs.firstOrNull()
     }
 
@@ -167,16 +179,9 @@ class AudioCapture(
      */
     private fun shouldReopenOn(devices: Array<out AudioDeviceInfo>?): Boolean {
         if (devices == null || devices.isEmpty()) return false
-        val activeId = record?.routedDevice?.id
+        val activeId = record?.routedDevice?.id ?: return false
         val inputs = devices.filter { it.isSource }
-        if (inputs.isEmpty()) return false
-        val touchesActive = activeId != null && inputs.any { it.id == activeId }
-        val higherPriority = inputs.any { d ->
-            d.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
-            d.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
-            d.type == AudioDeviceInfo.TYPE_USB_HEADSET
-        } && (record?.routedDevice?.type == AudioDeviceInfo.TYPE_BUILTIN_MIC || activeId == null)
-        return touchesActive || higherPriority
+        return inputs.any { it.id == activeId }
     }
 
     private fun reopen() {

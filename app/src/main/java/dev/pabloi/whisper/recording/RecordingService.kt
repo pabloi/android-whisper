@@ -23,6 +23,7 @@ import dev.pabloi.whisper.audio.AacWriter
 import dev.pabloi.whisper.audio.AudioCapture
 import dev.pabloi.whisper.audio.ChunkBuilder
 import dev.pabloi.whisper.audio.PcmFrame
+import dev.pabloi.whisper.audio.TimedChunk
 import dev.pabloi.whisper.audio.Vad
 import dev.pabloi.whisper.data.AudioSourcePreset
 import dev.pabloi.whisper.engine.AudioSource
@@ -69,7 +70,8 @@ class RecordingService : Service() {
     private var clockJob: Job? = null
     private var chunkForwardJob: Job? = null
     private var chunkBuilder: ChunkBuilder? = null
-    private var engineChunks: Channel<FloatArray>? = null
+    private var engineChunks: Channel<TimedChunk>? = null
+    private var engine: dev.pabloi.whisper.engine.local.LocalQnnWhisperEngine? = null
     private var currentRecording: Recording? = null
     private var startedAtMs: Long = 0L
 
@@ -232,9 +234,10 @@ class RecordingService : Service() {
     private fun startEngineLoop() {
         val app = applicationContext as WhisprApp
         val repo = app.repoForId(runBlocking { app.settings.flow.first().localModelId })
-        val engine = LocalQnnWhisperEngine(this, repo)
+        val eng = LocalQnnWhisperEngine(this, repo)
+        engine = eng
         val chunks = engineChunks!!.consumeAsFlow()
-        engineJob = engine.transcribe(AudioSource.LiveStream(chunks), TranscribeOptions(timestamps = true))
+        engineJob = eng.transcribe(AudioSource.LiveStream(chunks), TranscribeOptions(timestamps = true))
             .onEach { ev -> _events.emit(ev) }
             .launchIn(scope)
     }
@@ -262,6 +265,8 @@ class RecordingService : Service() {
                 chunkForwardJob?.cancel()
                 engineChunks?.close()
                 engineJob?.join()
+                runCatching { engine?.close() }
+                engine = null
                 aac?.close()
                 val rec = currentRecording
                 if (rec != null) {
@@ -322,6 +327,8 @@ class RecordingService : Service() {
         chunkForwardJob?.cancel(); chunkForwardJob = null
         engineChunks = null
         chunkBuilder = null
+        runCatching { engine?.close() }
+        engine = null
         // Close the AAC writer first so it can flush its EOS frames into both
         // the MediaMuxer .m4a (writing the moov) and the ADTS sidecar.
         runCatching { aac?.close() }

@@ -26,10 +26,10 @@ class ChunkBuilderTest {
         cb.close()
         val emitted = cb.flow.toList()
         assertEquals(1, emitted.size)
-        assertEquals(ChunkBuilder.CHUNK_SAMPLES, emitted[0].size)
+        assertEquals(ChunkBuilder.CHUNK_SAMPLES, emitted[0].samples.size)
         // Speech is at the front (it's zero-padded at the tail).
-        assertNotEquals(0f, emitted[0][0])
-        assertEquals(0f, emitted[0][ChunkBuilder.CHUNK_SAMPLES - 1])
+        assertNotEquals(0f, emitted[0].samples[0])
+        assertEquals(0f, emitted[0].samples[ChunkBuilder.CHUNK_SAMPLES - 1])
     }
 
     @Test fun forceFiresAt30Seconds() = runTest {
@@ -41,8 +41,8 @@ class ChunkBuilderTest {
         cb.close()
         val emitted = cb.flow.toList()
         assertEquals(2, emitted.size)
-        assertEquals(ChunkBuilder.CHUNK_SAMPLES, emitted[0].size)
-        assertEquals(ChunkBuilder.CHUNK_SAMPLES, emitted[1].size)
+        assertEquals(ChunkBuilder.CHUNK_SAMPLES, emitted[0].samples.size)
+        assertEquals(ChunkBuilder.CHUNK_SAMPLES, emitted[1].samples.size)
     }
 
     @Test fun pureSilenceEmitsNothing() = runTest {
@@ -63,6 +63,29 @@ class ChunkBuilderTest {
         val emitted = cb.flow.toList()
         assertEquals(2, emitted.size)
         // Carry-over assertion: structurally every emitted chunk is exactly CHUNK_SAMPLES.
-        assertTrue(emitted.all { it.size == ChunkBuilder.CHUNK_SAMPLES })
+        assertTrue(emitted.all { it.samples.size == ChunkBuilder.CHUNK_SAMPLES })
+    }
+
+    @Test fun chunkTimestampsReflectAudioTime() = runTest {
+        val cb = ChunkBuilder()
+        // First chunk: 1 s speech + 350 ms silence → emit. startSec should be 0.
+        repeat(50) { cb.feed(speechFrame()) }
+        repeat(18) { cb.feed(silenceFrame()) }
+        // Second chunk: another 1 s speech + 350 ms silence → emit.
+        repeat(50) { cb.feed(speechFrame()) }
+        repeat(18) { cb.feed(silenceFrame()) }
+        cb.close()
+        val emitted = cb.flow.toList()
+        assertEquals(2, emitted.size)
+        // First chunk starts at audio-time 0.
+        assertEquals(0.0, emitted[0].startSec, 0.001)
+        // Second chunk starts at the position of the carry-over front, which is
+        // (firstChunkLen − LEFT_CONTEXT_SAMPLES) samples into the stream. The
+        // silence-trigger fires after SILENCE_TRIGGER_MS (300 ms = 15 frames),
+        // not the full 18 we feed, so firstChunkLen at emit is:
+        //   50 speech frames (16000 samples) + 15 silence frames (4800 samples)
+        //   = 20800 samples.
+        // Expected startSec = (20800 − 3200) / 16000 = 1.10 s.
+        assertEquals(1.10, emitted[1].startSec, 0.01)
     }
 }

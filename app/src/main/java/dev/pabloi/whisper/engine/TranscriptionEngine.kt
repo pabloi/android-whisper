@@ -1,5 +1,6 @@
 package dev.pabloi.whisper.engine
 
+import dev.pabloi.whisper.audio.TimedChunk
 import kotlinx.coroutines.flow.Flow
 
 /**
@@ -41,7 +42,7 @@ sealed interface AudioSource {
      * live-recording path so chunks flow straight from `ChunkBuilder` to the
      * engine without round-tripping through MediaCodec.
      */
-    data class LiveStream(val chunks: kotlinx.coroutines.flow.Flow<FloatArray>) : AudioSource
+    data class LiveStream(val chunks: kotlinx.coroutines.flow.Flow<TimedChunk>) : AudioSource
 }
 
 data class TranscribeOptions(

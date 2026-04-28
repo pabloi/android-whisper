@@ -18,11 +18,12 @@ class ChunkBuilder(private val vad: Vad = Vad()) {
 
     private val buffer = FloatArray(CHUNK_SAMPLES)
     private var len = 0                   // valid samples in buffer (samples written so far)
+    private var bufferStartSamples: Long = 0L  // stream position of buffer[0]
     private var hasSpeech = false
     private var trailingSilenceFrames = 0 // consecutive silence frames at the tail
 
-    private val channel = Channel<FloatArray>(capacity = 16)
-    val flow: Flow<FloatArray> = channel.consumeAsFlow()
+    private val channel = Channel<TimedChunk>(capacity = 16)
+    val flow: Flow<TimedChunk> = channel.consumeAsFlow()
 
     suspend fun feed(frame: FloatArray) {
         require(frame.size == Vad.FRAME_SAMPLES) {
@@ -66,20 +67,25 @@ class ChunkBuilder(private val vad: Vad = Vad()) {
 
     private suspend fun emitAndReset(forceFire: Boolean) {
         if (!hasSpeech) {
-            // Pure-silence buffer: discard without emit.
+            // Pure-silence buffer: discard. Advance the stream pointer by `len`
+            // so the audio-time accounting stays correct across silent stretches.
+            bufferStartSamples += len.toLong()
             len = 0; trailingSilenceFrames = 0
             return
         }
         // Build a 30-s zero-padded snapshot.
         val out = FloatArray(CHUNK_SAMPLES)
         System.arraycopy(buffer, 0, out, 0, len)
-        channel.send(out)
+        val startSec = bufferStartSamples / Vad.SAMPLE_RATE_HZ.toDouble()
+        channel.send(TimedChunk(startSec, out))
 
-        // Carry the last LEFT_CONTEXT_SAMPLES of the just-emitted buffer to the front
-        // of the next buffer, so a word cut by force-fire reappears whole.
+        // Carry the last LEFT_CONTEXT_SAMPLES into the next buffer.
         val keepFrom = (len - LEFT_CONTEXT_SAMPLES).coerceAtLeast(0)
         val keep = len - keepFrom
         if (keep > 0) System.arraycopy(buffer, keepFrom, buffer, 0, keep)
+        // The new buffer's first sample sits at stream position
+        // (oldBufferStart + len_at_emit - keep).
+        bufferStartSamples += (len - keep).toLong()
         len = keep
         hasSpeech = false
         trailingSilenceFrames = 0

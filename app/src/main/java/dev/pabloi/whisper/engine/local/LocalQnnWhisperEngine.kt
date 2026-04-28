@@ -7,6 +7,7 @@ import ai.onnxruntime.OrtSession
 import android.content.Context
 import android.util.Log
 import dev.pabloi.whisper.audio.AudioDecoder
+import dev.pabloi.whisper.audio.TimedChunk
 import dev.pabloi.whisper.engine.AudioSource
 import dev.pabloi.whisper.engine.TranscribeEvent
 import dev.pabloi.whisper.engine.TranscribeOptions
@@ -132,10 +133,10 @@ class LocalQnnWhisperEngine(
 
         // Stream chunks straight off MediaCodec — never materialize the full
         // PCM. Memory stays bounded regardless of input length.
-        val source: Flow<FloatArray> = when (audio) {
-            is AudioSource.Pcm -> chunkPrebufferedPcm(audio.samples, chunkLen)
-            is AudioSource.File -> AudioDecoder.streamMonoF32(audio.path, chunkLen)
-            is AudioSource.Uri -> AudioDecoder.streamMonoF32(context, audio.uri, chunkLen)
+        val source: Flow<TimedChunk> = when (audio) {
+            is AudioSource.Pcm -> chunkPrebufferedPcm(audio.samples, chunkLen).withChunkTimes()
+            is AudioSource.File -> AudioDecoder.streamMonoF32(audio.path, chunkLen).withChunkTimes()
+            is AudioSource.Uri -> AudioDecoder.streamMonoF32(context, audio.uri, chunkLen).withChunkTimes()
             is AudioSource.LiveStream -> audio.chunks
         }
 
@@ -150,9 +151,9 @@ class LocalQnnWhisperEngine(
                 emit(TranscribeEvent.Progress(0.05f, "Mel ${cIdx + 1}"))
 
                 val melT0 = System.nanoTime()
-                val melFeatures = mel.compute(chunk)
+                val melFeatures = mel.compute(chunk.samples)
                 val melMs = (System.nanoTime() - melT0) / 1_000_000
-                Log.i(TAG, "BENCH chunk=$cIdx mel=${melMs}ms samples=${chunk.size}")
+                Log.i(TAG, "BENCH chunk=$cIdx mel=${melMs}ms samples=${chunk.samples.size}")
                 emit(TranscribeEvent.Progress(0.05f, "NPU transcribe ${cIdx + 1}"))
 
                 val tokens = runChunkWithRecovery(cIdx, melFeatures, options)
@@ -164,7 +165,7 @@ class LocalQnnWhisperEngine(
                     return@collect
                 }
 
-                val chunkStart = cIdx * MelSpectrogram.CHUNK_SECONDS.toDouble()
+                val chunkStart = chunk.startSec
                 val chunkEnd = chunkStart + MelSpectrogram.CHUNK_SECONDS
                 val rawText = tokenizer!!.decode(tokens, skipSpecial = true).trim()
                 // Whisper emits per-utterance timestamp tokens (`<|X.XX|>`,
@@ -212,6 +213,19 @@ class LocalQnnWhisperEngine(
             System.arraycopy(pcm, i, out, 0, n)
             emit(out)
             i += chunkLen
+        }
+    }
+
+    /**
+     * Wrap a Flow<FloatArray> as Flow<TimedChunk> assigning each chunk an
+     * incrementing 30-s start time (idx * MelSpectrogram.CHUNK_SECONDS).
+     * Used by File/Uri/Pcm sources where chunks ARE contiguous 30-s windows.
+     */
+    private fun Flow<FloatArray>.withChunkTimes(): Flow<TimedChunk> = flow {
+        var idx = 0
+        collect { samples ->
+            emit(TimedChunk(idx * MelSpectrogram.CHUNK_SECONDS.toDouble(), samples))
+            idx++
         }
     }
 
