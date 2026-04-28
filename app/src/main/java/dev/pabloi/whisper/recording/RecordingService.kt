@@ -216,9 +216,7 @@ class RecordingService : Service() {
                     if (builder != null) {
                         try {
                             for (frame16k in resampler.process(frame.pcm)) builder.feed(frame16k)
-                        } catch (_: kotlinx.coroutines.channels.ClosedSendChannelException) {
-                            /* paused mid-feed; ignore */
-                        }
+                        } catch (_: kotlinx.coroutines.channels.ClosedSendChannelException) { /* paused mid-feed */ }
                     }
                 }
 

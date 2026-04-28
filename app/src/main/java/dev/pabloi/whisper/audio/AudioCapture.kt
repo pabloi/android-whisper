@@ -101,6 +101,12 @@ class AudioCapture(
             .setBufferSizeInBytes(bufBytes).build()
         if (device != null) rec.preferredDevice = device
 
+        // Bring up the BT SCO link if we picked a BT mic. Without this,
+        // AudioRecord falls back to the built-in mic on most devices.
+        if (device?.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
+            ensureBluetoothSco(start = true, device = device)
+        }
+
         if (effectsOn) {
             if (NoiseSuppressor.isAvailable())     ns = NoiseSuppressor.create(rec.audioSessionId).apply { enabled = true }
             if (AutomaticGainControl.isAvailable()) agc = AutomaticGainControl.create(rec.audioSessionId).apply { enabled = true }
@@ -129,22 +135,12 @@ class AudioCapture(
     private fun pickActiveInputDevice(): AudioDeviceInfo? {
         val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         val inputs = am.getDevices(AudioManager.GET_DEVICES_INPUTS)
-
-        // Honor an explicit comm-device routing (e.g. user accepted a BT SCO
-        // call routing or a VOIP app called setCommunicationDevice). Otherwise
-        // the BT headset being merely paired/connected for media must NOT
-        // override the built-in mic for our recording.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val comm = am.communicationDevice
-            if (comm != null &&
-                comm.type != AudioDeviceInfo.TYPE_BUILTIN_MIC &&
-                comm.type != AudioDeviceInfo.TYPE_BUILTIN_EARPIECE &&
-                comm.type != AudioDeviceInfo.TYPE_BUILTIN_SPEAKER) {
-                inputs.firstOrNull { it.id == comm.id }?.let { return it }
-            }
-        }
-
-        return inputs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
+        // Prefer BT SCO or wired headset if present as input route, mirroring
+        // what the system picks when it routes voice (calls, voice recognition).
+        return inputs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
+            ?: inputs.firstOrNull { it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET }
+            ?: inputs.firstOrNull { it.type == AudioDeviceInfo.TYPE_USB_HEADSET }
+            ?: inputs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
             ?: inputs.firstOrNull()
     }
 
@@ -171,17 +167,24 @@ class AudioCapture(
     }
 
     /**
-     * Decide whether a device-list change merits a [reopen]. Filters out the
-     * synchronous initial "added" callback that fires at registration with the
-     * existing device list (which would otherwise cause a spurious teardown/rebuild
-     * right after [open]). Triggers only when the change involves the active route
-     * itself or a higher-priority input now present.
+     * Decide whether a device-list change merits a [reopen]. Triggers when:
+     *   - the currently-active device itself appeared or disappeared, or
+     *   - a higher-priority headset/SCO/USB input is now present while we are
+     *     recording from the built-in mic (so plugging in a BT headset mid-record
+     *     reroutes to it).
      */
     private fun shouldReopenOn(devices: Array<out AudioDeviceInfo>?): Boolean {
         if (devices == null || devices.isEmpty()) return false
-        val activeId = record?.routedDevice?.id ?: return false
+        val activeId = record?.routedDevice?.id
         val inputs = devices.filter { it.isSource }
-        return inputs.any { it.id == activeId }
+        if (inputs.isEmpty()) return false
+        val touchesActive = activeId != null && inputs.any { it.id == activeId }
+        val higherPriority = inputs.any { d ->
+            d.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+            d.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+            d.type == AudioDeviceInfo.TYPE_USB_HEADSET
+        } && (record?.routedDevice?.type == AudioDeviceInfo.TYPE_BUILTIN_MIC || activeId == null)
+        return touchesActive || higherPriority
     }
 
     private fun reopen() {
@@ -212,10 +215,46 @@ class AudioCapture(
 
     private fun stopReaderAndRecord() {
         readerJob?.cancel(); readerJob = null
+        // Release SCO before stopping the AudioRecord so the OS doesn't keep
+        // the link warm after we've gone idle.
+        ensureBluetoothSco(start = false, device = null)
         runCatching { record?.stop() }
         runCatching { record?.release() }; record = null
         runCatching { ns?.release() }; ns = null
         runCatching { agc?.release() }; agc = null
+    }
+
+    /**
+     * Bring the Bluetooth SCO link up (or down) when we want to capture from a
+     * BT headset mic. Without this, AudioRecord with preferredDevice = BT SCO
+     * silently routes to the built-in mic on most Android builds.
+     *
+     * On Android 12+ we use AudioManager.setCommunicationDevice (the modern
+     * API). On older devices we use the legacy startBluetoothSco / stopBluetoothSco
+     * pair, which is deprecated as of API 31 but still works through API 35.
+     */
+    private fun ensureBluetoothSco(start: Boolean, device: AudioDeviceInfo?) {
+        val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (start) {
+                if (device != null) am.setCommunicationDevice(device)
+            } else {
+                runCatching { am.clearCommunicationDevice() }
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            if (start) {
+                runCatching {
+                    am.mode = AudioManager.MODE_IN_COMMUNICATION
+                    am.startBluetoothSco()
+                }
+            } else {
+                runCatching {
+                    am.stopBluetoothSco()
+                    am.mode = AudioManager.MODE_NORMAL
+                }
+            }
+        }
     }
 
     private fun rmsDb(frame: ShortArray): Float {
