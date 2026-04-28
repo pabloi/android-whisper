@@ -73,11 +73,13 @@ class ChunkBuilder(private val vad: Vad = Vad()) {
             len = 0; trailingSilenceFrames = 0
             return
         }
-        // Build a 30-s zero-padded snapshot.
+        // Build a 30-s zero-padded snapshot. Duration reflects only the
+        // unpadded content — the silence-trigger window included.
         val out = FloatArray(CHUNK_SAMPLES)
         System.arraycopy(buffer, 0, out, 0, len)
         val startSec = bufferStartSamples / Vad.SAMPLE_RATE_HZ.toDouble()
-        channel.send(TimedChunk(startSec, out))
+        val durationSec = len / Vad.SAMPLE_RATE_HZ.toDouble()
+        channel.send(TimedChunk(startSec, durationSec, out))
 
         // Carry the last LEFT_CONTEXT_SAMPLES into the next buffer.
         val keepFrom = (len - LEFT_CONTEXT_SAMPLES).coerceAtLeast(0)

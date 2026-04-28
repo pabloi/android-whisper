@@ -166,7 +166,7 @@ class LocalQnnWhisperEngine(
                 }
 
                 val chunkStart = chunk.startSec
-                val chunkEnd = chunkStart + MelSpectrogram.CHUNK_SECONDS
+                val chunkEnd = chunkStart + chunk.durationSec
                 val rawText = tokenizer!!.decode(tokens, skipSpecial = true).trim()
                 // Whisper emits per-utterance timestamp tokens (`<|X.XX|>`,
                 // chunk-local 0–30 s); shift them to global file time by
@@ -224,7 +224,11 @@ class LocalQnnWhisperEngine(
     private fun Flow<FloatArray>.withChunkTimes(): Flow<TimedChunk> = flow {
         var idx = 0
         collect { samples ->
-            emit(TimedChunk(idx * MelSpectrogram.CHUNK_SECONDS.toDouble(), samples))
+            emit(TimedChunk(
+                startSec = idx * MelSpectrogram.CHUNK_SECONDS.toDouble(),
+                durationSec = MelSpectrogram.CHUNK_SECONDS.toDouble(),
+                samples = samples,
+            ))
             idx++
         }
     }

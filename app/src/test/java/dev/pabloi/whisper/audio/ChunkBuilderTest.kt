@@ -87,5 +87,11 @@ class ChunkBuilderTest {
         //   = 20800 samples.
         // Expected startSec = (20800 − 3200) / 16000 = 1.10 s.
         assertEquals(1.10, emitted[1].startSec, 0.01)
+        // First chunk duration: same firstChunkLen (50 speech + 15 silence
+        // frames at the silence-trigger fire point) gives durationSec =
+        //   65 frames × 320 samples / 16_000 Hz = 1.30 s.
+        // The chunk is zero-padded out to 30 s but durationSec reflects only
+        // the unpadded content.
+        assertEquals(1.30, emitted[0].durationSec, 0.01)
     }
 }
