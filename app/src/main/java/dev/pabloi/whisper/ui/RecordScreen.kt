@@ -73,10 +73,15 @@ fun RecordScreen(
             tryStart(vm, context)
         }
     }
-    val micLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (granted) tryStart(vm, context) { folderLauncher.launch(null) }
+    // Request RECORD_AUDIO and (on API 31+) BLUETOOTH_CONNECT together so the
+    // SCO bring-up path can route to a connected BT headset without silently
+    // falling back to the built-in mic.
+    val recordPermsLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { results ->
+        if (results[Manifest.permission.RECORD_AUDIO] == true) {
+            tryStart(vm, context) { folderLauncher.launch(null) }
+        }
     }
 
     Scaffold(
@@ -105,11 +110,19 @@ fun RecordScreen(
                     }
                     Button(
                         onClick = {
-                            val granted = ContextCompat.checkSelfPermission(
-                                context, Manifest.permission.RECORD_AUDIO
-                            ) == PackageManager.PERMISSION_GRANTED
-                            if (!granted) {
-                                micLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                            val needed = buildList {
+                                if (ContextCompat.checkSelfPermission(
+                                        context, Manifest.permission.RECORD_AUDIO
+                                    ) != PackageManager.PERMISSION_GRANTED
+                                ) add(Manifest.permission.RECORD_AUDIO)
+                                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S &&
+                                    ContextCompat.checkSelfPermission(
+                                        context, Manifest.permission.BLUETOOTH_CONNECT
+                                    ) != PackageManager.PERMISSION_GRANTED
+                                ) add(Manifest.permission.BLUETOOTH_CONNECT)
+                            }
+                            if (needed.isNotEmpty()) {
+                                recordPermsLauncher.launch(needed.toTypedArray())
                             } else tryStart(vm, context) { folderLauncher.launch(null) }
                         },
                         modifier = Modifier.fillMaxWidth().height(64.dp),
