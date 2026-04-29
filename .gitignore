@@ -36,3 +36,9 @@ models/
 *.onnx
 *.onnx_data
 *.bin
+
+# Claude Code per-machine settings
+.claude/
+
+# Transient logcat dumps
+*.log
