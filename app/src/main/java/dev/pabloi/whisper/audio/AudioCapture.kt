@@ -52,6 +52,8 @@ class AudioCapture(
     private var agc: AutomaticGainControl? = null
     private var deviceCb: AudioDeviceCallback? = null
     private var commDeviceListener: android.media.AudioManager.OnCommunicationDeviceChangedListener? = null
+    private var scoStateReceiver: android.content.BroadcastReceiver? = null
+    private var savedAudioMode: Int = AudioManager.MODE_NORMAL
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var readerJob: Job? = null
     @Volatile private var paused = false
@@ -106,7 +108,12 @@ class AudioCapture(
     }
 
     private fun configureAndStart(device: AudioDeviceInfo?, nativeRate: Int) {
-        val source = when (sourcePreset) {
+        val source = if (device?.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
+            // BT SCO requires the VOIP-style source on Samsung; the user's
+            // audio source preset (RECOGNITION / MIC / CAMCORDER) doesn't
+            // route through the comm device on this firmware.
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION
+        } else when (sourcePreset) {
             AudioSourcePreset.MIC -> MediaRecorder.AudioSource.MIC
             AudioSourcePreset.VOICE_RECOGNITION -> MediaRecorder.AudioSource.VOICE_RECOGNITION
             AudioSourcePreset.CAMCORDER -> MediaRecorder.AudioSource.CAMCORDER
@@ -266,67 +273,87 @@ class AudioCapture(
      * miss the edge, then wait up to 3 s for the listener to confirm.
      */
     private suspend fun bringUpBluetoothSco(btDevice: AudioDeviceInfo): Boolean {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
-            // Legacy path. Best-effort: kick off SCO and naively wait 1.5 s.
-            @Suppress("DEPRECATION")
-            runCatching {
-                val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-                am.mode = AudioManager.MODE_IN_COMMUNICATION
-                am.startBluetoothSco()
-            }
-            delay(1500)
-            return true
-        }
-
         // BLUETOOTH_CONNECT is required for setCommunicationDevice on API 31+.
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) !=
+                PackageManager.PERMISSION_GRANTED
+        ) {
             android.util.Log.w(TAG, "BLUETOOTH_CONNECT not granted; cannot route to BT SCO")
             return false
         }
 
         val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        savedAudioMode = am.mode
 
-        // Prefer the device from getAvailableCommunicationDevices — that list
-        // is the one setCommunicationDevice accepts.
-        val targetDevice = am.availableCommunicationDevices
-            .firstOrNull { it.id == btDevice.id }
-            ?: am.availableCommunicationDevices
-                .firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
-            ?: btDevice
+        // Samsung firmware requires MODE_IN_COMMUNICATION for SCO audio to
+        // actually stream — otherwise the route is "selected" but no bytes flow.
+        am.mode = AudioManager.MODE_IN_COMMUNICATION
 
-        // Listen for the routing change BEFORE requesting it, so we don't
-        // miss the edge.
-        val ready = CompletableDeferred<Boolean>()
-        val listener = AudioManager.OnCommunicationDeviceChangedListener { active ->
-            if (active != null && active.id == targetDevice.id) {
-                if (!ready.isCompleted) ready.complete(true)
+        // Two parallel "ready" signals: either is sufficient.
+        val ready = kotlinx.coroutines.CompletableDeferred<Boolean>()
+
+        // Legacy SCO state broadcast — definitive signal that the SCO audio
+        // link is up and carrying samples.
+        @Suppress("DEPRECATION")
+        val scoIntent = AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED
+        val receiver = object : android.content.BroadcastReceiver() {
+            override fun onReceive(c: android.content.Context?, intent: android.content.Intent?) {
+                @Suppress("DEPRECATION")
+                val state = intent?.getIntExtra(AudioManager.EXTRA_SCO_AUDIO_STATE, AudioManager.SCO_AUDIO_STATE_DISCONNECTED) ?: -1
+                @Suppress("DEPRECATION")
+                if (state == AudioManager.SCO_AUDIO_STATE_CONNECTED && !ready.isCompleted) {
+                    android.util.Log.i(TAG, "SCO_AUDIO_STATE_CONNECTED received")
+                    ready.complete(true)
+                }
             }
         }
-        am.addOnCommunicationDeviceChangedListener(
-            java.util.concurrent.Executors.newSingleThreadExecutor(),
-            listener,
-        )
-        commDeviceListener = listener
-
-        val current = am.communicationDevice
-        if (current?.id == targetDevice.id) {
-            // Already routed; resolve immediately.
-            if (!ready.isCompleted) ready.complete(true)
+        scoStateReceiver = receiver
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(receiver, android.content.IntentFilter(scoIntent), android.content.Context.RECEIVER_NOT_EXPORTED)
         } else {
-            val ok = am.setCommunicationDevice(targetDevice)
-            if (!ok) {
-                android.util.Log.w(TAG, "setCommunicationDevice($targetDevice) returned false")
-                am.removeOnCommunicationDeviceChangedListener(listener)
-                commDeviceListener = null
-                return false
+            context.registerReceiver(receiver, android.content.IntentFilter(scoIntent))
+        }
+
+        // Modern API 31+ comm-device-changed listener.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val targetDevice = am.availableCommunicationDevices
+                .firstOrNull { it.id == btDevice.id }
+                ?: am.availableCommunicationDevices
+                    .firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
+                ?: btDevice
+            val listener = AudioManager.OnCommunicationDeviceChangedListener { active ->
+                if (active != null && active.id == targetDevice.id && !ready.isCompleted) {
+                    android.util.Log.i(TAG, "OnCommunicationDeviceChanged → ${active.productName}")
+                    ready.complete(true)
+                }
+            }
+            am.addOnCommunicationDeviceChangedListener(java.util.concurrent.Executors.newSingleThreadExecutor(), listener)
+            commDeviceListener = listener
+
+            val current = am.communicationDevice
+            if (current?.id == targetDevice.id && !ready.isCompleted) {
+                android.util.Log.i(TAG, "comm device already routed to ${targetDevice.productName}")
+                // Don't complete yet — still wait for SCO audio state to confirm
+                // bytes actually flow. If broadcast never comes (some Samsung
+                // builds skip it once already connected), the comm-device check
+                // is our fallback signal.
+                ready.complete(true)
+            } else {
+                val ok = am.setCommunicationDevice(targetDevice)
+                if (!ok) {
+                    android.util.Log.w(TAG, "setCommunicationDevice($targetDevice) returned false")
+                }
             }
         }
 
-        val gotIt = withTimeoutOrNull(3000) { ready.await() } ?: false
+        // Legacy SCO start — required on Samsung in addition to setCommunicationDevice.
+        @Suppress("DEPRECATION")
+        runCatching { am.startBluetoothSco() }
+
+        val gotIt = withTimeoutOrNull(5000) { ready.await() } ?: false
         if (!gotIt) {
-            android.util.Log.w(TAG, "Timed out waiting for SCO routing to ${targetDevice.productName}")
-            am.removeOnCommunicationDeviceChangedListener(listener)
-            commDeviceListener = null
+            android.util.Log.w(TAG, "Timed out waiting for BT SCO routing")
+            tearDownBluetoothSco()
             return false
         }
         return true
@@ -334,17 +361,18 @@ class AudioCapture(
 
     private fun tearDownBluetoothSco() {
         val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        scoStateReceiver?.let {
+            runCatching { context.unregisterReceiver(it) }
+        }
+        scoStateReceiver = null
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             commDeviceListener?.let { am.removeOnCommunicationDeviceChangedListener(it) }
             commDeviceListener = null
             runCatching { am.clearCommunicationDevice() }
-        } else {
-            @Suppress("DEPRECATION")
-            runCatching {
-                am.stopBluetoothSco()
-                am.mode = AudioManager.MODE_NORMAL
-            }
         }
+        @Suppress("DEPRECATION")
+        runCatching { am.stopBluetoothSco() }
+        runCatching { am.mode = savedAudioMode }
     }
 
     private fun rmsDb(frame: ShortArray): Float {
