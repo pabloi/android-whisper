@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
 ## Build & run
 
@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 adb install -r --user 0 app/build/outputs/apk/debug/app-debug.apk
 ```
 
-`--user 0` is essential on Samsung phones with the **Dual App** feature on. Without it, every install is auto-mirrored to the secondary user (`DUAL_APP`, uid 95) and you end up with two icons on the launcher sharing nothing. Use `adb shell pm list users` to see if user 95 exists; if it does, always pass `--user 0`. To clean up an existing dual-app install: `adb uninstall --user 95 dev.pabloi.whisper.debug`.
+`--user 0` is essential on Samsung phones with the **Dual App** feature on. Without it, every install is auto-mirrored to the secondary user (`DUAL_APP`, uid 95) and you end up with two icons on the launcher sharing nothing. Use `adb shell pm list users` to check.
 
 Toolchain: Android SDK 35, NDK r26+, JDK 17.
 
@@ -34,40 +34,28 @@ Two engine implementations sit behind a single interface, `engine/TranscriptionE
 - `engine/local/LocalQnnWhisperEngine.kt` — Whisper-Large-v3-Turbo on the Hexagon NPU via ONNX Runtime's QNN execution provider, loading Qualcomm's pre-compiled QNN-ONNX bundle.
 - `engine/remote/RemoteOpenAIEngine.kt` — OkHttp multipart POST to any OpenAI-compatible `/v1/audio/transcriptions` endpoint.
 
-`engine/EngineFactory.kt` selects between them from `data/Settings.kt` (DataStore-backed `AppSettings`). UI (`ui/HomeScreen.kt`, `ui/RecordScreen.kt`, `ui/SettingsScreen.kt`, `ui/HomeViewModel.kt`, `ui/RecordViewModel.kt`) talks only to `TranscriptionEngine` — adding a third backend (e.g. a local HTTP server wrapping the QNN engine for an IME) means implementing the interface and wiring it through the factory. Do not leak engine-specific concepts into the UI layer.
+`engine/EngineFactory.kt` selects between them from `data/Settings.kt` (DataStore-backed `AppSettings`). UI (`ui/HomeScreen.kt`, `ui/RecordScreen.kt`, `ui/SettingsScreen.kt`, plus their ViewModels) talks only to `TranscriptionEngine` — adding a third backend means implementing the interface and wiring it through the factory.
 
-`AudioSource` is a sealed interface with four variants: `Uri` and `File` go through `audio/AudioDecoder.kt` (`MediaExtractor`+`MediaCodec` → 16 kHz mono f32 chunks); `Pcm` accepts an already-decoded FloatArray (tests / one-shot use); `LiveStream(Flow<TimedChunk>)` is the live-recording path — chunks come straight from `audio/ChunkBuilder.kt` with their actual `startSec` and `durationSec`, bypassing MediaCodec entirely. Live recording is on-device only; `RemoteOpenAIEngine` rejects `LiveStream` with `IllegalArgumentException`.
+`AudioSource` is a sealed interface with four variants: `Uri` and `File` go through `audio/AudioDecoder.kt` (`MediaExtractor`+`MediaCodec` → 16 kHz mono f32 chunks); `Pcm` accepts an already-decoded FloatArray; `LiveStream(Flow<TimedChunk>)` is the live-recording path — chunks come straight from `audio/ChunkBuilder.kt` with their actual `startSec` and `durationSec`, bypassing MediaCodec entirely. Live recording is on-device only; `RemoteOpenAIEngine` rejects `LiveStream`.
 
 ### Live-recording subsystem (`recording/` + `audio/`)
 
-`recording/RecordingService.kt` is a foreground microphone-typed service with a `PARTIAL_WAKE_LOCK`. It owns the only `audio/AudioCapture.kt` (which wraps `AudioRecord`) and fans the PCM stream into two parallel coroutine consumers:
+`recording/RecordingService.kt` is a foreground microphone-typed service with a `PARTIAL_WAKE_LOCK`. It owns `audio/AudioCapture.kt` (an `AudioRecord` wrapper) and fans the PCM stream into:
 
-1. **AAC writer** (always): `audio/AacWriter.kt` encodes mono PCM at the route's native sample rate to AAC-LC. Dual-writes the user-facing `<name>.m4a` (via `MediaMuxer`, finalised on stop) AND a hidden `.<name>.aac` ADTS sidecar. Per-frame `flush()` on the sidecar so a hard kill leaves a recoverable file. On orphan recovery, the sidecar remuxes to a valid `.m4a` in one pass.
+1. **AAC writer** (always): `audio/AacWriter.kt` encodes mono PCM at the route's native rate to AAC-LC. Dual-writes the user-facing `<name>.m4a` (`MediaMuxer`, finalised on stop) AND a hidden `.<name>.aac` ADTS sidecar with per-frame `flush()` so a hard kill leaves a recoverable file.
 2. **Transcription pipeline** (opt-in): resample-to-16k (`LiveResampler` inside `RecordingService.kt`) → `audio/ChunkBuilder.kt` (VAD-aligned cuts at silence ≥ 300 ms after speech, force-fire at 30 s, 200 ms left-context carryover) → `engineChunks: Channel<TimedChunk>` → `LocalQnnWhisperEngine.transcribe(LiveStream(...))`.
 
-`recording/RecordingState.kt` is the sealed state exposed via singleton flows on `RecordingService.Companion`: `Idle`, `Starting`, `Recording`, `Paused(reason)`, `Stopping`, `Failure(cause)`. The ViewModel observes without binding (same pattern as `ModelDownloadService`).
+`recording/RecordingState.kt` is the sealed state exposed via singleton flows on `RecordingService.Companion`. The ViewModel observes without binding (same pattern as `ModelDownloadService`). `recording/RecordingsStore.kt` persists a JSON-encoded index of past recordings (cap 200, newest first).
 
-`recording/Recording.kt` + `recording/RecordingsStore.kt` persist a JSON-encoded index of past recordings (cap 200, newest first, oldest evicted from the index — disk artifacts untouched).
-
-The PCM consumer in `RecordingService.launchPcmConsumers` ALWAYS calls `aac.append(...)` so the `.m4a` is continuous, but the chunkbuilder feed is gated on `state.value is RecordingState.Recording` and wraps `builder.feed(...)` in `try/catch ClosedSendChannelException` to handle the audio-focus pause race window cleanly.
+Audio focus pause/resume: phone calls / alarms trigger `pauseDueToFocus` (capture pauses, current ChunkBuilder closes flushing pre-call partial speech, AAC encoder pauses with muxer left open). On `AUDIOFOCUS_GAIN` a fresh ChunkBuilder is wired in and the recording continues into the same `.m4a`.
 
 ### Bluetooth SCO recording — Samsung-compat (read this before touching `AudioCapture`)
 
-Samsung's Android firmware will not actually open the BT SCO audio stream from `setCommunicationDevice(btScoDevice)` alone. To make BT recording work, `AudioCapture.bringUpBluetoothSco` does ALL of:
-
-1. Saves `am.mode` and sets `am.mode = AudioManager.MODE_IN_COMMUNICATION`.
-2. Registers `AudioManager.OnCommunicationDeviceChangedListener` (API 31+) AND a `BroadcastReceiver` for `AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED` BEFORE requesting the route.
-3. Calls `am.setCommunicationDevice(btScoDevice)`.
-4. ALSO calls legacy `am.startBluetoothSco()` (deprecated as of API 31 but still required on Samsung firmware through API 35).
-5. Waits up to 5 s with `withTimeoutOrNull` for either signal (modern listener OR legacy `SCO_AUDIO_STATE_CONNECTED` broadcast) — whichever fires first means the link carries audio.
-6. On AudioRecord configuration, `MediaRecorder.AudioSource.VOICE_COMMUNICATION` is forced when route is BT (the user's `audioSourcePreset` only applies to built-in mic). `VOICE_RECOGNITION` would silently fall through to built-in even when comm-device is BT.
-7. On stop, `tearDownBluetoothSco` reverses everything: unregisters receiver + listener, calls `am.clearCommunicationDevice()` + legacy `am.stopBluetoothSco()`, restores `savedAudioMode`.
-
-`BLUETOOTH_CONNECT` is a runtime permission on Android 12+; it's declared in the manifest AND requested at runtime from `RecordScreen` together with `RECORD_AUDIO`. Without `BLUETOOTH_CONNECT`, `setCommunicationDevice` returns false and the SCO bring-up bails (and falls back to built-in).
+Samsung Android firmware will not actually open the BT SCO audio stream from `setCommunicationDevice(btScoDevice)` alone. `AudioCapture.bringUpBluetoothSco` does ALL of: set `am.mode = MODE_IN_COMMUNICATION` (saving the previous mode), register `OnCommunicationDeviceChangedListener` AND a `BroadcastReceiver` for `ACTION_SCO_AUDIO_STATE_UPDATED` BEFORE requesting the route, call `setCommunicationDevice` AND legacy `startBluetoothSco()`, then wait up to 5 s for either signal. AudioRecord uses `MediaRecorder.AudioSource.VOICE_COMMUNICATION` when the route is BT — `VOICE_RECOGNITION` falls through to built-in mic on Samsung. `BLUETOOTH_CONNECT` is a runtime permission on Android 12+ and is requested from `RecordScreen` together with `RECORD_AUDIO`.
 
 ### Chunk timestamps for live vs file paths
 
-`audio/TimedChunk.kt` carries `(startSec, durationSec, samples)`. For the file/uri/pcm path, `LocalQnnWhisperEngine.withChunkTimes()` wraps each emission with `(idx * 30, 30, samples)` since chunks ARE contiguous 30-s windows. For LiveStream, `ChunkBuilder.emitAndReset` computes `startSec = bufferStartSamples / 16000` and `durationSec = len / 16000` BEFORE zero-padding, so VAD-aligned chunks of variable real length get accurate segment timestamps. The engine emits `TranscribeEvent.Segment(text, startSec, startSec + durationSec)`. Don't revert this to `cIdx * 30` — for live recording each chunk is shorter than 30 s and the wall-clock label would lie.
+`audio/TimedChunk.kt` carries `(startSec, durationSec, samples)`. For File/Uri/Pcm, `withChunkTimes()` wraps each emission with `(idx * 30, 30, samples)` since chunks ARE contiguous 30-s windows. For LiveStream, `ChunkBuilder.emitAndReset` computes `startSec = bufferStartSamples / 16000` and `durationSec = len / 16000` BEFORE zero-padding. Don't revert this to `cIdx * 30` for live recording — chunks are variable-length and the wall-clock label would lie.
 
 ### Local engine I/O contract — read this before touching it
 
@@ -95,7 +83,7 @@ Setting QNN HTP to `burst` mode forces the Hexagon adsprpc kernel driver into bu
 - Compose + Material 3 + Navigation Compose; Kotlin 2.1 with the Compose compiler plugin (no kapt/KSP in use). State is hoisted into ViewModels; screens are stateless.
 - Coroutines `Flow` is the cross-layer event channel. `TranscriptionEngine.transcribe` returns a `Flow<TranscribeEvent>` (`Progress` / `Segment` / `Final` / `Failure`) — preserve that surface for new engines so the UI doesn't fork.
 - No `READ_EXTERNAL_STORAGE`. Files only enter via SAF (`GET_CONTENT`, `OpenDocumentTree`) or `SEND`/`VIEW` intents declared in the manifest. Do not add broader storage permissions to work around a file path issue — fix the SAF call instead.
-- The `RecordingService` is a singleton with a strict state machine: only `RecordingState.Idle` accepts a fresh start; `EXTRA_STOP=true` on `onStartCommand` routes to `stopSelfAsync` which runs the orderly finalise path (cancel-and-join `pcmJob`, close ChunkBuilder, drain engine, close `AacWriter` so `moov` is written, mark recording `FINALISED` in store). `stopService()`-driven `onDestroy` is treated as crash recovery — the orphan-recovery path is the cleanup. Don't shortcut user-Stop through `stopService()`.
+- The `RecordingService` is a singleton with a strict state machine: `EXTRA_STOP=true` on `onStartCommand` routes to `stopSelfAsync` (orderly finalise: cancel-and-join `pcmJob`, close ChunkBuilder, drain engine, close `AacWriter` so the `moov` is written, mark recording `FINALISED`). `stopService()`-driven `onDestroy` is treated as crash recovery — don't shortcut user-Stop through it.
 - `MutableSharedFlow` for audio frames uses `BufferOverflow.SUSPEND` (not `DROP_OLDEST`). Encoder stalls back-pressure the mic reader rather than silently dropping audio.
 - Keystores (`*.jks`, `*.keystore`) and model artifacts (`*.onnx`, `*.onnx_data`, `*.bin`, `models/`) are gitignored — never commit them.
-- Design + plan for the live-recording feature live at `docs/superpowers/specs/2026-04-27-record-live-design.md` and `docs/superpowers/plans/2026-04-27-record-live.md`. New recording-related work should reference / update those.
+- Design + plan for the live-recording feature live at `docs/superpowers/specs/2026-04-27-record-live-design.md` and `docs/superpowers/plans/2026-04-27-record-live.md`.

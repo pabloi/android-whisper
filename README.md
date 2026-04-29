@@ -7,14 +7,23 @@ OpenAI-compatible `/v1/audio/transcriptions` endpoint.
 
 ## Status
 
-**v1 — file transcription, working end-to-end on real hardware.**
-Pick an audio file (`.wav`, `.m4a`, `.mp3`, `.flac`, `.ogg/.opus`,
-`.webm`, anything Android's `MediaCodec` decodes), transcribe on-device,
-get a saved transcript file alongside the source.
+**v2 — file transcription + live recording, working end-to-end on real
+hardware.** Two entry points:
+
+- **Pick audio file**: SAF picker → on-device or remote transcription
+  → live transcript file written alongside the source. Any container
+  Android's `MediaCodec` decodes.
+- **Record Live**: tap a button, capture from the phone mic or a
+  connected Bluetooth / wired headset (Samsung-compat SCO routing),
+  AAC-encoded `.m4a` lands in a user-chosen SAF folder, and the
+  on-device NPU transcribes alongside as VAD-aligned chunks fire.
+  Survives screen-off, Doze, Freecess, and incoming calls (auto pause
+  + resume). Crash-safe via an ADTS sidecar that can be remuxed back
+  to a valid `.m4a` on next launch if the process is killed.
 
 Verified on a Samsung Galaxy S24 Ultra (SM-S928U1, Android 14) with
-the JFK inaugural address (~21 minutes, MP3) running on
-`whisper_large_v3_turbo` against the Hexagon NPU.
+the JFK inaugural address (~21 min MP3) and live mic + BT headset
+recording on `whisper_large_v3_turbo`.
 
 ### Measured performance (S24 Ultra, large-v3-turbo)
 
@@ -55,15 +64,65 @@ than real-time, sustained over 21 minutes (42 chunks).**
   public folders without an explicit folder grant).
 - **Remote engine fallback** — POST to any OpenAI-compatible
   `/v1/audio/transcriptions`. Works with OpenAI, faster-whisper-server,
-  vLLM, RunPod community templates.
+  vLLM, RunPod community templates. (Live recording is on-device only;
+  remote is rejected with `IllegalArgumentException` on `LiveStream`
+  because per-chunk round-trips over classroom Wi-Fi are unreliable.)
+- **Live recording from phone mic / BT / wired headset.**
+  `RecordingService` (foreground, `microphone`-typed, `PARTIAL_WAKE_LOCK`)
+  owns the only `AudioRecord` and fans the PCM stream into two parallel
+  consumers: an AAC writer that always runs, and an opt-in transcription
+  pipeline (resample-to-16k → VAD-aligned `ChunkBuilder` → engine). The
+  AAC writer's failure can never kill the transcriber and vice versa.
+- **Bluetooth SCO recording (Samsung-compat).** Bringing up SCO on
+  Samsung firmware needs the full set: `AudioManager.MODE_IN_COMMUNICATION`
+  + legacy `startBluetoothSco()` + `setCommunicationDevice()` (API 31+) +
+  a `BroadcastReceiver` for `ACTION_SCO_AUDIO_STATE_UPDATED` to confirm
+  the link actually carries audio. AudioRecord uses
+  `MediaRecorder.AudioSource.VOICE_COMMUNICATION` when the route is BT
+  (the user's source preset only applies to built-in mic).
+- **VAD-aligned chunking** (`audio/Vad.kt` + `audio/ChunkBuilder.kt`).
+  Cuts at silences ≥ 300 ms after detected speech, force-fires at 30 s,
+  carries 200 ms left-context across cuts so a word clipped by force-fire
+  reappears whole in the next chunk. Pure-silence buffers are skipped.
+  Each emitted `TimedChunk` carries its real `startSec`/`durationSec` so
+  segment timestamps reflect actual audio time, not chunk index × 30 s.
+- **Crash-safe AAC writes.** `AacWriter` dual-writes the user-facing
+  `<name>.m4a` (`MediaMuxer`, finalised on stop) and a hidden
+  `.<name>.aac` ADTS sidecar. ADTS frames are self-describing — every
+  frame is independently decodable — so a hard kill mid-record leaves a
+  recoverable file. On orphan recovery, the sidecar is remuxed to a
+  fresh `.m4a` in one pass (no transcoding).
+- **Audio focus pause/resume.** Phone calls and other transient focus
+  losses pause the recording cleanly: `AudioCapture.pause()` halts the
+  mic reader, the current `ChunkBuilder` is closed (flushing any
+  pre-call partial speech to the engine), the AAC encoder is paused
+  with the muxer left open. On `AUDIOFOCUS_GAIN`, a fresh
+  `ChunkBuilder` is wired up and the recording continues into the
+  same `.m4a`. The recording state machine handles this without
+  tearing down the session.
+- **Recordings list** on the Home screen surfaces past sessions
+  (DataStore-backed JSON index, cap 200, newest first, evicted from
+  the index — disk artifacts untouched).
+- **Unit + instrumented tests.** Pure-Kotlin tests for `Vad`,
+  `ChunkBuilder`, `RecordingsStore`, and `AppSettings` round-trips run
+  under `:app:testDebugUnitTest`. `AacWriter` and `AudioCapture` have
+  instrumented tests under `:app:connectedDebugAndroidTest`.
 
 ## Architecture
 
 ```
 app/src/main/java/dev/pabloi/whisper/
-├── audio/AudioDecoder.kt           # Streaming MediaExtractor+MediaCodec → 16k mono f32 chunks
+├── audio/
+│   ├── AudioDecoder.kt             # Streaming MediaExtractor+MediaCodec → 16k mono f32 chunks
+│   ├── AudioCapture.kt             # AudioRecord wrapper: route picking, BT SCO setup,
+│   │                                  AGC/NS effects, 20-ms PCM frames, RMS level meter
+│   ├── AacWriter.kt                # PCM → AAC-LC + ADTS sidecar for crash recovery
+│   ├── Vad.kt                      # Energy + zero-crossing voice detector (pure Kotlin)
+│   ├── ChunkBuilder.kt             # 16-kHz buffer, VAD-aligned cuts, 30-s force-fire
+│   └── TimedChunk.kt               # Chunk + startSec + durationSec for live segment timestamps
 ├── engine/
 │   ├── TranscriptionEngine.kt      # Stable interface + AudioSource/Options/Event
+│   │                                  (incl. AudioSource.LiveStream for the recording path)
 │   ├── EngineFactory.kt            # Picks engine from settings
 │   ├── local/
 │   │   ├── ModelCatalog.kt         # ModelSpec rows for tiny/base/small/turbo
@@ -74,19 +133,34 @@ app/src/main/java/dev/pabloi/whisper/
 │   │   ├── WhisperTokenizer.kt     # GPT-2 byte-level decoder over tokenizer.json
 │   │   └── LocalQnnWhisperEngine.kt # ORT+QNN encoder + greedy KV-cache decode (fp16)
 │   └── remote/
-│       └── RemoteOpenAIEngine.kt    # OkHttp multipart to /v1/audio/transcriptions
+│       └── RemoteOpenAIEngine.kt   # OkHttp multipart to /v1/audio/transcriptions
+├── recording/                      # Live-recording subsystem
+│   ├── RecordingService.kt         # Foreground microphone-typed service: owns AudioCapture,
+│   │                                  fans PCM into AacWriter (always) + ChunkBuilder→engine
+│   │                                  (opt-in), AudioFocus pause/resume, wake lock
+│   ├── RecordingState.kt           # Idle / Starting / Recording / Paused / Stopping / Failure
+│   ├── Recording.kt                # @Serializable record-of-record (path, dur, route, state)
+│   └── RecordingsStore.kt          # DataStore JSON index of past recordings (cap 200)
 ├── data/
-│   ├── Settings.kt                 # DataStore-backed preferences
+│   ├── Settings.kt                 # DataStore-backed preferences (incl. recording knobs)
 │   └── TranscriptWriter.kt         # MediaStore.Downloads streaming writer
-├── ui/                             # Compose screens + ViewModel
-├── MainActivity.kt
+├── ui/                             # Compose screens + ViewModels
+│   ├── HomeScreen.kt               # File-pick + Record Live entry points + recordings list
+│   ├── RecordScreen.kt             # Live recording UI: meter, timer, segments, perm prompts
+│   ├── RecordViewModel.kt          # Observes RecordingService flows, dedupes overlap
+│   ├── HomeViewModel.kt
+│   └── SettingsScreen.kt           # Engine/api/lang/timestamps + Recording section
+├── MainActivity.kt                 # NavHost: home / record / settings
 └── WhisprApp.kt
 ```
 
 The `TranscriptionEngine` interface is the contract both engines
 satisfy; UI talks to it through `EngineFactory`. A future on-device
 HTTP server (for an IME or other processes to consume the local
-engine) plugs into the same interface.
+engine) plugs into the same interface. Live recording reuses the
+engine via the `AudioSource.LiveStream(Flow<TimedChunk>)` variant —
+chunks flow straight from `ChunkBuilder` into the existing per-chunk
+encode/decode loop without round-tripping through MediaCodec.
 
 ## Models
 
@@ -115,7 +189,20 @@ Prerequisites:
 
 ```
 ./gradlew :app:assembleDebug
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb install -r --user 0 app/build/outputs/apk/debug/app-debug.apk
+```
+
+`--user 0` matters on Samsung phones with the **Dual App** feature
+enabled — without it, every install is auto-mirrored to the secondary
+user (`DUAL_APP`, uid 95) and you end up with two icons on the
+launcher sharing nothing. `--user 0` keeps the install scoped to the
+primary user.
+
+### Tests
+
+```
+./gradlew :app:testDebugUnitTest         # JVM unit tests (Vad, ChunkBuilder, RecordingsStore, Settings)
+./gradlew :app:connectedDebugAndroidTest # AacWriter + AudioCapture instrumented (real device)
 ```
 
 The Gradle config restricts native libs to `arm64-v8a`. **Keep
@@ -175,48 +262,58 @@ detail.
   21 min of f32 PCM is 80 MB on its own; an `ArrayList<Short>` for
   decoded PCM autoboxes into hundreds of MB. Stream chunks; don't
   materialize.
+- **Samsung BT SCO needs the full compat dance.**
+  `setCommunicationDevice(btScoDevice)` and the
+  `OnCommunicationDeviceChangedListener` confirmation only update the
+  routing pointer — on Samsung firmware, the actual SCO audio stream
+  doesn't open unless you ALSO set `MODE_IN_COMMUNICATION` and call
+  legacy `startBluetoothSco()`, AND you wait for
+  `ACTION_SCO_AUDIO_STATE_UPDATED → SCO_AUDIO_STATE_CONNECTED` before
+  starting AudioRecord. Plus `AudioRecord.AudioSource` must be
+  `VOICE_COMMUNICATION` (not `VOICE_RECOGNITION`) when the route is BT
+  — otherwise the OS happily falls through to built-in mic and your
+  `.m4a` is silent. `BLUETOOTH_CONNECT` is a runtime permission on
+  Android 12+; it must be granted before any of this works.
+- **`AudioDeviceCallback.onAudioDevicesAdded` fires synchronously at
+  registration** with the current device list. A naïve "always reopen
+  on add/remove" callback will tear down the just-started AudioRecord
+  immediately. `AudioCapture.shouldReopenOn` filters by whether the
+  active device or a higher-priority headset actually appeared.
+- **`MutableSharedFlow` with `DROP_OLDEST` silently drops audio** when
+  a downstream stalls. For lecture-recording the right policy is
+  `SUSPEND` so back-pressure becomes a visible silent meter, not
+  invisible data loss.
+- **Samsung Dual App** mirrors any new install to user 95 by default,
+  giving you two icons on the launcher. Use `adb install -r --user 0
+  ...` to install only to the primary user.
 
 ## Future work
 
-### Streaming + recording mode (lectures, meetings)
+### Live recording — done in v2
 
-Idea: hit a record button, the app starts capturing from the mic
-*and* transcribing simultaneously, with results appearing as text
-shortly after each utterance. Output is a live transcript file that
-keeps growing while the recording is ongoing.
+The "Streaming + recording mode" originally scoped here shipped as
+the **Record Live** feature. Design + plan are in
+`docs/superpowers/specs/2026-04-27-record-live-design.md` and
+`docs/superpowers/plans/2026-04-27-record-live.md`.
 
-Open design questions to think through before implementing:
+### Live recording — refinements not yet done
 
-- **Window size + overlap.** The current path processes fixed,
-  non-overlapping 30 s windows — fine for files but produces a lag of
-  one full window before a phrase appears. Possible alternatives:
-  - Smaller fixed windows (e.g. 10 s). Trades latency for accuracy:
-    Whisper was trained on 30 s; shorter windows lose context.
-  - Sliding window: process the trailing 10 s of audio every 1–2 s,
-    then stitch deduplicated tokens. Closer to real-time at the cost
-    of redundant compute (each second of audio gets transcribed ~5–10
-    times). Stitching is fiddly — Whisper output isn't word-aligned.
-  - Hybrid: short (10 s) for live preview that gets revised, then
-    a 30 s pass produces the canonical transcript that overwrites the
-    preview.
-- **Voice-activity detection.** Don't burn NPU on silence; trigger a
-  decode pass on speech end + brief silence. WebRTC VAD or Silero VAD
-  ports both fit the bill.
-- **Audio capture.** `AudioRecord` with 16 kHz mono PCM16 → reuse
-  the existing `AudioSource.Pcm` path. Foreground service for
-  long-running recording (similar shape to `ModelDownloadService`),
-  with a sticky notification.
-- **Backpressure.** If the NPU can't keep up (small model: yes,
-  large-v3-turbo at 8.5× real-time: yes), capture and inference run
-  comfortably in lockstep. If we ever fall behind, we drop oldest
-  pending audio rather than memory-grow.
-- **UX.** Live partial transcript on screen, scrolling, with timestamps
-  relative to recording start. Pause/resume/stop. Auto-save to the
-  same `Download/Whispr/` location as file mode.
-
-This is a meaningful chunk of work — 2–3 days of design + build —
-but the engine pieces are mostly already there: the streaming
-chunk path, the foreground service pattern, the segment writer.
+- **Orphan-recovery UI**. `RecordingsStore` already tracks
+  `Recording.State.RECORDING` / `ORPHANED` entries; on next launch
+  after a process kill, surface a "Recover & transcribe" affordance
+  that remuxes the ADTS sidecar into a fresh `.m4a` and runs
+  file-based transcription on it. Today, orphans appear in the
+  recordings list but with no recovery button.
+- **Replace energy+ZCR VAD with Silero**. Current `Vad.kt` is a
+  trivial heuristic with thresholds tuned for `VOICE_RECOGNITION` +
+  AGC-on. Silero VAD is small (~2 MB ONNX), runs comfortably on CPU,
+  and has dramatically lower false-silence on telephony-bandwidth (BT
+  SCO 8 kHz) audio.
+- **Audio device picker UI**. The Settings → Recording section
+  exposes the audio source preset and an effects toggle, but the
+  active input device is auto-picked. A manual override (drop-down
+  listing connected mics) would help reproducible testing of the BT
+  vs built-in paths.
 
 ### Other follow-ups
 
@@ -226,9 +323,10 @@ chunk path, the foreground service pattern, the segment writer.
 - **NDK port of the mel FFT.** Mel is now ~1.2 s the first chunk
   and ~600 ms steady-state on CPU — ~25 % of total wall-clock.
   Inner FFT is the hot loop; everything else is cheap.
-- **Whisper timestamp tokens.** Engine currently uses chunk-window
-  bounds (`cIdx * 30s`); enabling Whisper's `<|0.00|>`-style segment
-  timestamps gives finer granularity within each chunk.
+- **Whisper timestamp tokens.** Engine currently emits per-chunk
+  bounds (`startSec`/`durationSec` from `TimedChunk`); enabling
+  Whisper's `<|0.00|>`-style segment timestamps gives finer
+  granularity within each chunk.
 - **Force language / task token prefixes** in the local engine
   decode loop. The QNN-compiled decoder doesn't auto-pick up the
   setting; needs explicit token sequencing in the first decoder
