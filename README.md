@@ -108,6 +108,37 @@ than real-time, sustained over 21 minutes (42 chunks).**
   under `:app:testDebugUnitTest`. `AacWriter` and `AudioCapture` have
   instrumented tests under `:app:connectedDebugAndroidTest`.
 
+## For a follow-up agent (start here)
+
+If you're picking this up cold to build or extend the project:
+
+1. **Read `CLAUDE.md` first** (or `AGENTS.md` — same content, both
+   are checked in). It's the source of truth for architectural
+   contracts, package layout conventions, and the traps that will
+   silently break things (`htp_performance_mode`, fp16 buffers,
+   `extractNativeLibs`, Samsung BT SCO, Dual-App install). Every
+   trap listed in [Hard-won lessons](#hard-won-lessons) below is
+   already re-explained in `CLAUDE.md` with the full context —
+   don't rediscover them.
+2. **Branch:** `claude/whisper-android-app-icYkl`. All work has
+   landed there; `main` is behind. Push follow-up work to the same
+   branch or a child of it, and never force-push over other
+   sessions' commits.
+3. **Live-recording design + plan** live at
+   `docs/superpowers/specs/2026-04-27-record-live-design.md` and
+   `docs/superpowers/plans/2026-04-27-record-live.md`. Read both
+   before touching anything under `recording/` or `audio/`; update
+   them if you extend that subsystem.
+4. **Smoke test before touching anything** — see
+   [Smoke test](#smoke-test-end-to-end-sanity-check) below. If a
+   clean checkout doesn't produce a working APK on the device, fix
+   that before starting new work.
+5. **Priority for next work** is in [Roadmap](#roadmap),
+   most-impactful first. The top three (orphan-recovery UI, Silero
+   VAD, force-lang-token in the local decoder) are the highest-value
+   refinements to the shipped v2 feature set. Ship them one at a
+   time, each in its own commit with a clear message.
+
 ## Architecture
 
 ```
@@ -198,6 +229,12 @@ user (`DUAL_APP`, uid 95) and you end up with two icons on the
 launcher sharing nothing. `--user 0` keeps the install scoped to the
 primary user.
 
+The Gradle config restricts native libs to `arm64-v8a`. **Keep
+`jniLibs.useLegacyPackaging = true`** — QNN's fastrpc DSP loader
+requires the `*Skel.so` files to live at a real on-disk path, and
+the modern `extractNativeLibs="false"` default mmap's them inside the
+APK where the DSP can't dlopen them.
+
 ### Tests
 
 ```
@@ -205,11 +242,29 @@ primary user.
 ./gradlew :app:connectedDebugAndroidTest # AacWriter + AudioCapture instrumented (real device)
 ```
 
-The Gradle config restricts native libs to `arm64-v8a`. **Keep
-`jniLibs.useLegacyPackaging = true`** — QNN's fastrpc DSP loader
-requires the `*Skel.so` files to live at a real on-disk path, and
-the modern `extractNativeLibs="false"` default mmap's them inside the
-APK where the DSP can't dlopen them.
+### Smoke test (end-to-end sanity check)
+
+Before starting new work, verify the current build actually runs on
+the device. Type checking is not enough — QNN session load, model
+download, and audio routing all only fail at runtime.
+
+1. `./gradlew :app:testDebugUnitTest` → passes.
+2. `./gradlew :app:assembleDebug` → APK builds.
+3. `adb install -r --user 0 app/build/outputs/apk/debug/app-debug.apk`
+   → installs cleanly (no `INSTALL_FAILED_*`).
+4. Launch the app; Settings → pick `whisper_tiny` (smallest download,
+   ~120 MB) and hit Download. Sticky notification appears; download
+   completes even with screen off.
+5. Home → Pick audio file → any short `.m4a`/`.wav`. Segments should
+   appear within a few seconds; final transcript writes to
+   `Download/Whispr/…-transcript.txt`.
+6. Home → Record Live → Start. Level meter moves; stop after ~10 s.
+   `.m4a` lands in the chosen SAF folder; live segments appeared while
+   recording.
+7. `adb logcat -s LocalQnnWhisperEngine RecordingService AudioCapture`
+   → no `Failure`, no `IllegalStateException`, no `OrtException`.
+
+If any step fails, that's the first thing to fix.
 
 ### Signing for release
 
@@ -287,53 +342,71 @@ detail.
   giving you two icons on the launcher. Use `adb install -r --user 0
   ...` to install only to the primary user.
 
-## Future work
+## Roadmap
 
-### Live recording — done in v2
+Prioritized most-impactful first. The top three are the natural
+next batch of work; the rest are longer-horizon.
 
-The "Streaming + recording mode" originally scoped here shipped as
-the **Record Live** feature. Design + plan are in
-`docs/superpowers/specs/2026-04-27-record-live-design.md` and
-`docs/superpowers/plans/2026-04-27-record-live.md`.
+### Refinements to shipped features
 
-### Live recording — refinements not yet done
+1. **Orphan-recovery UI.** `RecordingsStore` already tracks
+   `Recording.State.RECORDING` / `ORPHANED` entries; on next launch
+   after a process kill, surface a "Recover & transcribe" affordance
+   that remuxes the ADTS sidecar into a fresh `.m4a` and runs
+   file-based transcription on it. Today, orphans appear in the
+   recordings list but with no recovery button. Small, self-contained,
+   directly rescues data users would otherwise lose. **Start here.**
+2. **Silero VAD in place of `Vad.kt`.** Current VAD is an
+   energy + zero-crossing heuristic tuned for `VOICE_RECOGNITION`
+   with AGC on; it under-detects speech on telephony-bandwidth (BT
+   SCO 8 kHz) audio and over-detects on line noise. Silero VAD is a
+   ~2 MB ONNX model that runs comfortably on CPU. Drop it into
+   `audio/`, feed 20-ms frames, gate `ChunkBuilder`'s speech-active
+   decision on it. Big quality win for the live-recording path.
+3. **Force language / task token prefixes** in the local engine
+   decode loop. The QNN-compiled decoder emits its own language
+   token today; the language hint in Settings is silently ignored on
+   the local path. Insert the seed sequence
+   `[SOT, <|lang|>, <|task|>, <|notimestamps|>]` before greedy
+   decode starts and run the graph once per seed token to prime the
+   self-attention KV cache. Improves accuracy on multilingual audio.
 
-- **Orphan-recovery UI**. `RecordingsStore` already tracks
-  `Recording.State.RECORDING` / `ORPHANED` entries; on next launch
-  after a process kill, surface a "Recover & transcribe" affordance
-  that remuxes the ADTS sidecar into a fresh `.m4a` and runs
-  file-based transcription on it. Today, orphans appear in the
-  recordings list but with no recovery button.
-- **Replace energy+ZCR VAD with Silero**. Current `Vad.kt` is a
-  trivial heuristic with thresholds tuned for `VOICE_RECOGNITION` +
-  AGC-on. Silero VAD is small (~2 MB ONNX), runs comfortably on CPU,
-  and has dramatically lower false-silence on telephony-bandwidth (BT
-  SCO 8 kHz) audio.
-- **Audio device picker UI**. The Settings → Recording section
-  exposes the audio source preset and an effects toggle, but the
-  active input device is auto-picked. A manual override (drop-down
-  listing connected mics) would help reproducible testing of the BT
-  vs built-in paths.
+### Perf & accuracy
 
-### Other follow-ups
-
-- **Beam search / temperature ladder / no-speech-prob fallback** in
-  the local engine. Current decoder is pure greedy argmax; matches
-  reference Whisper only on clean audio.
 - **NDK port of the mel FFT.** Mel is now ~1.2 s the first chunk
   and ~600 ms steady-state on CPU — ~25 % of total wall-clock.
-  Inner FFT is the hot loop; everything else is cheap.
-- **Whisper timestamp tokens.** Engine currently emits per-chunk
-  bounds (`startSec`/`durationSec` from `TimedChunk`); enabling
-  Whisper's `<|0.00|>`-style segment timestamps gives finer
-  granularity within each chunk.
-- **Force language / task token prefixes** in the local engine
-  decode loop. The QNN-compiled decoder doesn't auto-pick up the
-  setting; needs explicit token sequencing in the first decoder
-  step.
-- **Diarization** (who-said-what).
-- **On-device HTTP server** so an IME / other apps can call into the
-  local engine without the GUI.
+  Inner FFT (currently a direct DFT with a precomputed twiddle
+  matrix) is the hot loop; everything else is cheap. A radix-mixed
+  or Bluestein FFT in C++ via JNI would drop it to <100 ms.
+- **Beam search / temperature ladder / no-speech-prob fallback**
+  in the local engine. Current decoder is pure greedy argmax;
+  matches reference Whisper only on clean audio. Reference Whisper
+  temperature ladder: retry with increasing temp on
+  no-speech-prob > 0.6 or compression ratio > 2.4.
+- **Whisper `<|0.00|>` timestamp tokens.** Engine currently emits
+  per-chunk bounds from `TimedChunk`; enabling Whisper's internal
+  segment timestamps gives finer granularity within each 30-s chunk.
+
+### UI
+
+- **Audio device picker UI.** Settings → Recording exposes the source
+  preset and effects toggle, but the active input device is auto-picked.
+  A manual override (drop-down listing connected mics) would help
+  reproducible testing of the BT vs built-in paths.
+- **Transcript editor.** Segments are read-only; users may want to
+  fix a hallucination inline before sharing.
+
+### Longer-horizon
+
+- **On-device HTTP server** wrapping `LocalQnnWhisperEngine` so an
+  IME (or Tasker, or any other process) can call into the local
+  engine without launching the GUI. This is what enables the
+  Whisper-as-keyboard vision. Plug it in behind
+  `TranscriptionEngine` so the UI stays engine-agnostic.
+- **IME (soft-keyboard) built on the local HTTP server.**
+- **Diarization** (who-said-what). Requires a separate speaker
+  embedding model; consider a pyannote export or a lightweight
+  ResNet embedding + clustering pass.
 
 ## Licensing
 
